@@ -24,7 +24,7 @@ CATEGORIES = [
     "Weapons",
     "Uncategorized",
     "Allow only",
-    "EVERYTHING",
+    "Global Block All",
 ]
 
 KEYWORDS = {
