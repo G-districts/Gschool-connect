@@ -24,6 +24,7 @@ CATEGORIES = [
     "Streaming Services",
     "Weapons",
     "Uncategorized",
+    "Allow only",
 ]
 
 # Lightweight keyword heuristics (expandable)
@@ -48,6 +49,7 @@ KEYWORDS = {
     "Weapons": ["knife","guns","rifle","ammo","silencer","tactical"],
     "Entertainment": ["tv shows","movies","anime","cartoons","jokes","memes"],
     "Built-in Apps": ["calculator","camera","clock","files app"],  # placeholder
+    "Allow only": ["g district","canvas","k12","k12.instructure.com/"],
 }
 
 def _fetch_html(url: str, timeout=3):
