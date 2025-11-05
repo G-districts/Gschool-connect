@@ -24,6 +24,7 @@ CATEGORIES = [
     "Weapons",
     "Uncategorized",
     "Allow only",
+    "EVERYTHING",
 ]
 
 KEYWORDS = {
@@ -48,7 +49,8 @@ KEYWORDS = {
     "Entertainment": ["tv shows","movies","anime","cartoons","jokes","memes"],
     "Built-in Apps": ["calculator","camera","clock","files app"],
     # ✅ Fixed keywords for Allow only (normalized)
-    "Allow only": ["gdistrict", "canvas", "k12", "instructure.com"],
+    "Allow only": ["canvas", "k12", "instructure.com"],
+
 }
 
 def _fetch_html(url: str, timeout=3):
