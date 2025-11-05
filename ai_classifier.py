@@ -48,8 +48,8 @@ KEYWORDS = {
     "Religion": ["church","synagogue","mosque","bible study","quran","sermon"],
     "Weapons": ["knife","guns","rifle","ammo","silencer","tactical"],
     "Entertainment": ["tv shows","movies","anime","cartoons","jokes","memes"],
-    "Built-in Apps": ["calculator","camera","clock","files app"],  # placeholder
-    "Allow only": ["g district","canvas","k12","k12.instructure.com/"],
+    "Built-in Apps": ["calculator","camera","clock","files app"],
+    "Allow only": ["g district","canvas","k12","k12.instructure.com"],
 }
 
 def _fetch_html(url: str, timeout=3):
