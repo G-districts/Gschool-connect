@@ -96,14 +96,45 @@ def api_classify():
     html = body.get("html")
     result = classify(url, html)
 
+    # --- Load settings ---
+    default_redirect = get_setting("blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block")
     with _db() as conn:
         cur = conn.cursor()
+
+        # Get global allowlist
+        cur.execute("CREATE TABLE IF NOT EXISTS overrides (k TEXT PRIMARY KEY, v TEXT)")
+        conn.commit()
+        cur.execute("SELECT v FROM overrides WHERE k='allowlist'")
+        row = cur.fetchone()
+        allowlist = json.loads(row[0]) if row and row[0] else []
+
+        # Check if "Global Block All" is active
+        cur.execute("SELECT blocked FROM categories WHERE name=?", ("Global Block All",))
+        row = cur.fetchone()
+        global_block_on = bool(row and row[0])
+
+        # Get normal category rule
         cur.execute("SELECT blocked, block_url FROM categories WHERE name=?", (result["category"],))
         row = cur.fetchone()
-        blocked = bool(row[0]) if row else False
+        cat_blocked = bool(row[0]) if row else False
         cat_block_url = row[1] if row else None
 
-    default_redirect = get_setting("blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block")
+    # --- Handle Global Block All Mode ---
+    allowed_domains = ["blocked.gdistrict.org"]
+    if global_block_on:
+        # Check if URL is in allowlist or allowed domains
+        allowed = any(a.lower() in url.lower() for a in allowlist + allowed_domains)
+        if not allowed:
+            return jsonify({
+                "ok": True,
+                "url": url,
+                "result": result,
+                "blocked": True,
+                "block_url": default_redirect
+            })
+
+    # --- Normal AI blocking ---
+    blocked = cat_blocked
     final_block_url = cat_block_url or default_redirect
 
     return jsonify({
@@ -113,6 +144,7 @@ def api_classify():
         "blocked": blocked,
         "block_url": final_block_url
     })
+
 
 @ai.route("/chat/send", methods=["POST"])
 def chat_send():
