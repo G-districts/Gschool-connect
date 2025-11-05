@@ -1,4 +1,3 @@
-
 from flask import Blueprint, request, jsonify
 import sqlite3, os, json, time
 from ai_classifier import classify, CATEGORIES
@@ -14,6 +13,7 @@ def _db():
 def ensure_schema():
     with _db() as conn:
         cur = conn.cursor()
+        # Tables
         cur.execute("""CREATE TABLE IF NOT EXISTS categories(
             name TEXT PRIMARY KEY,
             blocked INTEGER DEFAULT 0,
@@ -31,10 +31,13 @@ def ensure_schema():
             text TEXT,
             ts INTEGER
         )""")
-        # seed categories if empty
-        cur.execute("SELECT COUNT(*) FROM categories")
-        if cur.fetchone()[0] == 0:
-            for c in CATEGORIES:
+        conn.commit()
+
+        # Seed categories if any missing
+        cur.execute("SELECT name FROM categories")
+        existing = {r[0] for r in cur.fetchall()}
+        for c in CATEGORIES:
+            if c not in existing:
                 cur.execute("INSERT OR IGNORE INTO categories(name, blocked, block_url) VALUES(?,?,?)", (c, 0, None))
         conn.commit()
 
@@ -51,29 +54,39 @@ def set_setting(key, value):
         cur.execute("INSERT OR REPLACE INTO settings(k,v) VALUES(?,?)", (key, json.dumps(value)))
         conn.commit()
 
-@ai.route("/categories", methods=["GET","POST"])
+@ai.route("/categories", methods=["GET", "POST"])
 def categories():
     ensure_schema()
-    if request.method == "POST":
-        body = request.json or {}
-        name = body.get("name")
-        blocked = 1 if body.get("blocked") else 0
-        block_url = body.get("block_url")
-        if not name: return jsonify({"ok":False,"error":"name required"}),400
-        with _db() as conn:
-            cur = conn.cursor()
+    with _db() as conn:
+        cur = conn.cursor()
+
+        # Update category (same frontend behavior)
+        if request.method == "POST":
+            body = request.json or {}
+            name = body.get("name")
+            blocked = 1 if body.get("blocked") else 0
+            block_url = body.get("block_url")
+            if not name:
+                return jsonify({"ok": False, "error": "name required"}), 400
             cur.execute("INSERT OR IGNORE INTO categories(name, blocked, block_url) VALUES(?,?,?)",
                         (name, blocked, block_url))
             cur.execute("UPDATE categories SET blocked=?, block_url=? WHERE name=?",
                         (blocked, block_url, name))
             conn.commit()
-        return jsonify({"ok":True})
-    else:
-        with _db() as conn:
-            cur = conn.cursor()
-            cur.execute("SELECT name, blocked, block_url FROM categories ORDER BY name")
-            rows = [{"name":n,"blocked":bool(b),"block_url":u} for (n,b,u) in cur.fetchall()]
-        return jsonify({"ok":True,"categories":rows})
+            return jsonify({"ok": True})
+
+        # Auto-add any missing categories silently
+        cur.execute("SELECT name FROM categories")
+        existing = {r[0] for r in cur.fetchall()}
+        for c in CATEGORIES:
+            if c not in existing:
+                cur.execute("INSERT OR IGNORE INTO categories(name, blocked, block_url) VALUES(?,?,?)", (c, 0, None))
+        conn.commit()
+
+        # Return exactly what frontend expects
+        cur.execute("SELECT name, blocked, block_url FROM categories ORDER BY name")
+        rows = [{"name": n, "blocked": bool(b), "block_url": u} for (n, b, u) in cur.fetchall()]
+        return jsonify({"ok": True, "categories": rows})
 
 @ai.route("/classify", methods=["POST"])
 def api_classify():
@@ -82,7 +95,7 @@ def api_classify():
     url = body.get("url") or ""
     html = body.get("html")
     result = classify(url, html)
-    # policy
+
     with _db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT blocked, block_url FROM categories WHERE name=?", (result["category"],))
@@ -92,9 +105,15 @@ def api_classify():
 
     default_redirect = get_setting("blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block")
     final_block_url = cat_block_url or default_redirect
-    return jsonify({"ok":True, "url":url, "result":result, "blocked":blocked, "block_url": final_block_url})
 
-# Simple REST chat as a fallback
+    return jsonify({
+        "ok": True,
+        "url": url,
+        "result": result,
+        "blocked": blocked,
+        "block_url": final_block_url
+    })
+
 @ai.route("/chat/send", methods=["POST"])
 def chat_send():
     ensure_schema()
@@ -103,23 +122,24 @@ def chat_send():
     user_id = b.get("user_id") or "unknown"
     role = b.get("role") or "student"
     text = (b.get("text") or "").strip()[:1000]
-    if not text: return jsonify({"ok":False,"error":"empty"}),400
-    ts = int(time.time()*1000)
+    if not text:
+        return jsonify({"ok": False, "error": "empty"}), 400
+    ts = int(time.time() * 1000)
     with _db() as conn:
         cur = conn.cursor()
         cur.execute("INSERT INTO chat_messages(room,user_id,role,text,ts) VALUES(?,?,?,?,?)",
-                    (room,user_id,role,text,ts))
+                    (room, user_id, role, text, ts))
         conn.commit()
-    return jsonify({"ok":True,"ts":ts})
+    return jsonify({"ok": True, "ts": ts})
 
 @ai.route("/chat/poll", methods=["GET"])
 def chat_poll():
     ensure_schema()
-    room = request.args.get("room","*")
-    since = int(request.args.get("since","0") or 0)
+    room = request.args.get("room", "*")
+    since = int(request.args.get("since", "0") or 0)
     with _db() as conn:
         cur = conn.cursor()
         cur.execute("SELECT user_id, role, text, ts FROM chat_messages WHERE room=? AND ts>? ORDER BY ts ASC",
                     (room, since))
-        rows = [{"user_id":u,"role":r,"text":t,"ts":ts} for (u,r,t,ts) in cur.fetchall()]
-    return jsonify({"ok":True,"messages":rows})
+        rows = [{"user_id": u, "role": r, "text": t, "ts": ts} for (u, r, t, ts) in cur.fetchall()]
+    return jsonify({"ok": True, "messages": rows})
