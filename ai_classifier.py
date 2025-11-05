@@ -1,4 +1,3 @@
-
 import re, tldextract, requests
 from html import unescape
 
@@ -27,7 +26,6 @@ CATEGORIES = [
     "Allow only",
 ]
 
-# Lightweight keyword heuristics (expandable)
 KEYWORDS = {
     "AI Chatbots & Tools": ["chatgpt","openai","bard","claude","copilot","perplexity.ai","writesonic","midjourney"],
     "Social Media": ["tiktok","instagram","snapchat","facebook","x.com","twitter","reddit","discord","tumblr","be.real"],
@@ -49,7 +47,8 @@ KEYWORDS = {
     "Weapons": ["knife","guns","rifle","ammo","silencer","tactical"],
     "Entertainment": ["tv shows","movies","anime","cartoons","jokes","memes"],
     "Built-in Apps": ["calculator","camera","clock","files app"],
-    "Allow only": ["g district","canvas","k12","k12.instructure.com"],
+    # ✅ Fixed keywords for Allow only (normalized)
+    "Allow only": ["gdistrict", "canvas", "k12", "instructure.com"],
 }
 
 def _fetch_html(url: str, timeout=3):
@@ -63,7 +62,6 @@ def _fetch_html(url: str, timeout=3):
 
 def _textify(html: str):
     if not html: return ""
-    # very rough tag removal
     txt = re.sub(r"<script[\s\S]*?</script>", " ", html, flags=re.I)
     txt = re.sub(r"<style[\s\S]*?</style>", " ", txt, flags=re.I)
     txt = re.sub(r"<[^>]+>", " ", txt)
@@ -75,37 +73,38 @@ def classify(url: str, html: str = None):
     """
     Returns dict: {category: str, confidence: float}
     """
-    # Normalize and extract
     if not (url or "").startswith(("http://","https://")):
         url = "https://" + (url or "")
     ext = tldextract.extract(url)
     domain = ".".join([p for p in [ext.domain, ext.suffix] if p])
     host = ".".join([p for p in [ext.subdomain, ext.domain, ext.suffix] if p if p])
 
-    # Try heuristic scoring
     tokens = [url.lower(), host.lower(), domain.lower()]
     body = _textify(html) if html else _textify(_fetch_html(url))
     if body:
         tokens.append(body)
 
-    scores = {c:0 for c in CATEGORIES}
+    scores = {c: 0 for c in CATEGORIES}
     for cat, kws in KEYWORDS.items():
         for kw in kws:
             pat = kw.lower()
-            hits = sum(t.count(pat) for t in tokens)
-            if hits:
-                scores[cat] += hits
+            for t in tokens:
+                if pat in t:
+                    scores[cat] += 1
 
     # Special-case rules
     if any(s in domain for s in ["edu",".edu"]): scores["General / Education"] += 3
     if any(s in url for s in ["wp-login","/wp-content/"]): scores["Blogs"] += 1
 
-    # Choose best
-    best_cat = max(scores, key=lambda c: scores[c])
-    if scores[best_cat] == 0:
-        best_cat = "Uncategorized"
+    # ✅ Prioritize Allow only
+    if scores["Allow only"] > 0:
+        best_cat = "Allow only"
+    else:
+        best_cat = max(scores, key=lambda c: scores[c])
+        if scores[best_cat] == 0:
+            best_cat = "Uncategorized"
 
-    # Confidence = normalized score-ish
     total = sum(scores.values()) or 1
     conf = scores[best_cat] / total
     return {"category": best_cat, "confidence": float(conf), "domain": domain, "host": host}
+
