@@ -367,8 +367,52 @@
 <div id="raiseTray"></div>
 <div id="overlay"><div class="spin"></div></div>
 
-<!-- ========= Dialogs ========= -->
+<!-- ========= Session-aware fetch (must be before any other scripts) ========= -->
+<script>
+  // Session id from server injection or query param
+  const SESSION_ID =
+    (typeof window !== 'undefined' && window.__SESSION_ID__) ||
+    new URLSearchParams(location.search).get('session') || '';
 
+  const _origFetch = window.fetch.bind(window);
+
+  function _withSession(url, init = {}) {
+    try {
+      const u = new URL(url, location.origin);
+      if (u.pathname.startsWith('/api/')) {
+        if (SESSION_ID) u.searchParams.set('session', SESSION_ID);
+        init.headers = Object.assign({}, init.headers, { 'X-Session-ID': SESSION_ID });
+        return _origFetch(u.toString(), init);
+      }
+      return _origFetch(url, init);
+    } catch {
+      return _origFetch(url, init);
+    }
+  }
+
+  window.fetch = (input, init) => {
+    if (typeof input === 'string') return _withSession(input, init || {});
+    if (input instanceof Request) {
+      const headers = new Headers(input.headers);
+      return _withSession(input.url, {
+        method: input.method, headers, body: input.body, mode: input.mode,
+        credentials: input.credentials, cache: input.cache, redirect: input.redirect,
+        referrer: input.referrer, integrity: input.integrity, keepalive: input.keepalive, signal: input.signal
+      });
+    }
+    return _origFetch(input, init);
+  };
+
+  // Helper to sessionize non-API links
+  function withSessionQuery(href) {
+    if (!SESSION_ID) return href;
+    const u = new URL(href, location.origin);
+    u.searchParams.set('session', SESSION_ID);
+    return u.toString();
+  }
+</script>
+
+<!-- ========= Dialogs & App Logic ========= -->
 <!-- Student modal (legacy, still available) -->
 <dialog id="studentDlg">
   <h4 id="dlgTitle">Student</h4>
@@ -476,37 +520,7 @@
   </div>
 </dialog>
 
-<!-- Create / Edit Scene -->
-<dialog id="sceneDlg">
-  <h4 id="sceneDlgTitle">Create Scene</h4>
-  <div class="grid" style="grid-template-columns:1fr 1fr">
-    <label>Name <input id="sceneName" placeholder="Math Class Scene" /></label>
-    <label>Description (optional) <input id="sceneDesc" placeholder="Websites used for class" /></label>
-  </div>
-
-  <details style="margin-top:8px"><summary>Advanced Filtering</summary>
-    <small class="muted">Use one pattern per line. Wildcards supported (e.g., <code>*://*.wikipedia.org/*</code>)</small>
-  </details>
-
-  <div class="grid" style="grid-template-columns:1fr 1fr; margin-top:6px">
-    <label>Allowed list<textarea id="sceneAllow" rows="8" placeholder="https://classroom.google.com
-*://*.khanacademy.org/*"></textarea></label>
-    <label>Blocked list<textarea id="sceneBlock" rows="8" placeholder="*://*.youtube.com/*
-*://*.tiktok.com/*"></textarea></label>
-  </div>
-
-  <div class="row" style="justify-content:space-between; margin-top:8px">
-    <div class="row" style="gap:10px">
-      <label class="row" style="gap:6px"><input id="sceneTypeAllowed" name="sceneType" type="radio" checked> Allowed Websites Scene</label>
-      <label class="row" style="gap:6px"><input id="sceneTypeBlocked" name="sceneType" type="radio"> Blocked Websites Scene</label>
-    </div>
-    <div class="row" style="gap:8px">
-      <button class="btn" id="sceneSave">Save</button>
-      <button class="btn secondary" id="sceneCancel">Cancel</button>
-    </div>
-  </div>
-</dialog>
-
+<!-- ============== Main App Scripts ============== -->
 <script>
 /* -----------------------------------------------------------
    Utilities
@@ -566,16 +580,18 @@ const state = {
 };
 
 /* -----------------------------------------------------------
-   Load initial class data
+   Load initial class data (UPDATED to /api/class/set)
 ----------------------------------------------------------- */
 async function loadData(){
-  const j=await (await fetch('/api/data')).json();
-  $('#focus').checked=j.classes.period1.focus_mode; 
-  $('#paused').checked=j.classes.period1.paused;
-  $('#chatEnabled').checked=j.settings.chat_enabled; 
-  $('#active').checked=j.classes.period1.active;
-  $('#classTitle').textContent = j.classes.period1.name || 'MEGACLASS';
-  $('#updateTime').textContent = 'Update Time';
+  const j = await (await fetch('/api/class/set', { method:'GET' })).json();
+  const cls = (j.class || {});
+  const stg = (j.settings || {});
+  $('#focus').checked = !!cls.focus_mode; 
+  $('#paused').checked = !!cls.paused;
+  $('#chatEnabled').checked = !!stg.chat_enabled; 
+  $('#active').checked = !!cls.active;
+  $('#classTitle').textContent = cls.name || 'G district';
+  $('#updateTime').textContent = new Date().toLocaleTimeString();
 }
 loadData();
 
@@ -1499,5 +1515,41 @@ setInterval(loadExamViolations, 5000);
 loadExamViolations();
 </script>
 
-<div style="position:fixed;right:16px;bottom:16px;background:#0b57d0;color:#fff;padding:10px 14px;border-radius:10px;box-shadow:0 6px 16px rgba(0,0,0,.2);font-weight:600"><a href="/teacher/present" style="color:#fff;text-decoration:none">🖥️ Teacher Presentation</a></div></body>
+<!-- Session activity gate: disable controls if session inactive -->
+<script>
+async function enforceSessionActiveUI(){
+  if (!SESSION_ID) return; // not locked to a session — leave as-is
+  try{
+    const j = await (await fetch(`/api/sessions/${encodeURIComponent(SESSION_ID)}`)).json();
+    const isActive = !!j.active;
+    const disable = !isActive;
+
+    const ids = [
+      'focusBtn','pauseBtn','announceBtn','notifyBtn','openTabsBtn','examBtn','pollBtn',
+      'saveClass','applyChat','offTaskApply'
+    ];
+    ids.forEach(id => { const el = document.getElementById(id); if (el) el.disabled = disable; });
+
+    // annotate title
+    const title = document.getElementById('classTitle');
+    if (title) {
+      title.textContent = (title.textContent.replace(/\s*\(inactive\)$/,''))
+                        + (disable ? ' (inactive)' : '');
+    }
+  }catch(e){ /* ignore */ }
+}
+enforceSessionActiveUI();
+setInterval(enforceSessionActiveUI, 10000);
+</script>
+
+<!-- Presentation link now session-aware -->
+<div style="position:fixed;right:16px;bottom:16px;background:#0b57d0;color:#fff;padding:10px 14px;border-radius:10px;box-shadow:0 6px 16px rgba(0,0,0,.2);font-weight:600">
+  <a id="presentLink" href="/teacher/present" style="color:#fff;text-decoration:none">🖥️ Teacher Presentation</a>
+</div>
+<script>
+  const pl = document.getElementById('presentLink');
+  if (pl) pl.href = withSessionQuery(pl.getAttribute('href'));
+</script>
+
+</body>
 </html>
