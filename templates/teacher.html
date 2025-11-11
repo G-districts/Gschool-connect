@@ -113,12 +113,9 @@
   @keyframes spin{to{transform:rotate(360deg)}}
 
   /* ===== Student Monitor ===== */
-  #monitorDlg { width:min(1600px, 98vw); max-height:96vh; padding:0; }
- .monitor-shell {
-  display:grid;
-  grid-template-columns:2.6fr 260px; /* Bigger screen, smaller chat */
-  gap:0;
-  height:min(94vh,920px);
+#monitorDlg { width:clamp(1100px, 98vw, 2200px); max-height:98vh; padding:0; }
+.monitor-shell{
+  display:grid; grid-template-columns:1.6fr 360px; gap:0; height:min(92vh,860px)
 }
 
   .monitor-title{font-weight:700}
