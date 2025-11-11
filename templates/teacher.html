@@ -113,10 +113,8 @@
   @keyframes spin{to{transform:rotate(360deg)}}
 
   /* ===== Student Monitor ===== */
-  /* CHANGED: widen dialog for bigger viewing area */
-  #monitorDlg { width:min(1800px, 98vw); max-height:96vh; padding:0; }
-  /* CHANGED: give more space to the browser area and a slimmer chat pane, slightly taller */
-  .monitor-shell{display:grid; grid-template-columns:2fr 300px; gap:0; height:min(94vh,920px)}
+  #monitorDlg { width:min(1600px, 98vw); max-height:96vh; padding:0; }
+  .monitor-shell{display:grid; grid-template-columns:1.6fr 360px; gap:0; height:min(92vh,860px)}
   .monitor-top{
     display:flex; align-items:center; gap:10px; padding:12px 14px;
     border-bottom:1px solid var(--border); background:var(--panel);
@@ -143,8 +141,7 @@
   .tabhead .title{white-space:nowrap; overflow:hidden; text-overflow:ellipsis; max-width:180px}
   .tabhead .close{margin-left:4px; font-weight:700; color:#888; cursor:pointer}
   .tabhead .close:hover{color:#333}
-  /* CHANGED: bigger tab thumbnails so tabs are easy to see */
-  .tabthumb{width:100%; height:80px; object-fit:cover; border:1px solid #e5e8f0; border-radius:8px; background:#fff}
+  .tabthumb{width:100%; height:48px; object-fit:cover; border:1px solid #e5e8f0; border-radius:8px; background:#fff}
 
   .monitor-canvas{flex:1; display:flex; align-items:center; justify-content:center; background:#0b1b3410; padding:8px}
   .monitor-canvas img{width:100%; height:100%; object-fit:contain; border-radius:10px; background:#000}
@@ -1121,7 +1118,7 @@ document.getElementById('saveDoodles').onclick = async ()=>{
 };
 document.getElementById('applyChat').onclick = async ()=>{
   const enabled = document.getElementById('chatEnabled').checked;
-  await fetch('/api/class/set',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({chat_enabled: enabled})});
+  await fetch('/api/class/set',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({chat_enabled: enabled})});
   alert("Chat has been " + (enabled ? "enabled" : "disabled"));
 };
 
@@ -1135,7 +1132,7 @@ async function applyScene(id){
 }
 async function disableScene(){
   $('#sceneDropdown').classList.remove('open');
-  await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({disable:true})});
+  await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({disable:true})});
   toast('Scene disabled'); loadScenes();
 }
 async function deleteScene(id){
