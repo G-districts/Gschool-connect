@@ -1583,6 +1583,224 @@ except Exception as _e:
     print("AI routes not loaded:", _e)
 
 
+
+# # === SESSIONS/STUDENTS API ADDED ===
+import time as _time
+import uuid as _uuid
+
+def _ensure_sessions_students(store):
+    store = ensure_keys(store)
+    if "students" not in store or not isinstance(store.get("students"), list):
+        store["students"] = []
+    if "sessions" not in store or not isinstance(store.get("sessions"), list):
+        store["sessions"] = []
+    if "active_sessions" not in store or not isinstance(store.get("active_sessions"), list):
+        store["active_sessions"] = []
+    return store
+
+def _reconcile_active_sessions(store):
+    store = _ensure_sessions_students(store)
+    sessions_by_id = {s.get("id"): s for s in store.get("sessions", [])}
+    active = set(store.get("active_sessions", []))
+    for sid, sess in sessions_by_id.items():
+        if _session_is_scheduled_active(sess):
+            active.add(sid)
+        else:
+            if sid in active and not sess.get("manual", False):
+                active.discard(sid)
+    store["active_sessions"] = list(active)
+    return store
+
+def _weekly_match(entry, now_local=None):
+    try:
+        import datetime as _dt
+        now = now_local or _dt.datetime.now()
+        weekday = now.weekday()
+        if weekday not in (entry.get("days") or []):
+            return False
+        sh, sm = [int(x) for x in str(entry.get("start","00:00")).split(":")]
+        eh, em = [int(x) for x in str(entry.get("end","23:59")).split(":")]
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        return start_dt <= now <= end_dt
+    except Exception:
+        return False
+
+def _oneoff_match(entry, now_ts=None):
+    try:
+        from datetime import datetime
+        now_ts = now_ts or _time.time()
+        def parse_iso(s):
+            if not s: return None
+            s = s.replace("Z","+00:00") if s.endswith("Z") else s
+            return datetime.fromisoformat(s)
+        s = parse_iso(entry.get("startISO"))
+        e = parse_iso(entry.get("endISO"))
+        return s and e and (s.timestamp() <= now_ts <= e.timestamp())
+    except Exception:
+        return False
+
+def _session_is_scheduled_active(sess):
+    sch = (sess or {}).get("schedule") or {}
+    entries = sch.get("entries") or []
+    for ent in entries:
+        t = ent.get("type")
+        if t == "weekly" and _weekly_match(ent):
+            return True
+        if t == "oneoff" and _oneoff_match(ent):
+            return True
+    return False
+
+def _effective_state_for_student(store, student_id):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    sessions = store.get("sessions", [])
+    active_ids = set(store.get("active_sessions", []))
+    relevant = [s for s in sessions if s.get("id") in active_ids and student_id in (s.get("students") or [])]
+    merged = {"focusMode": False, "allowlist": [], "examMode": False, "examUrl": "", "session_ids": [s.get("id") for s in relevant]}
+    allow = set()
+    for s in relevant:
+        c = s.get("controls") or {}
+        if c.get("focusMode"): merged["focusMode"] = True
+        if c.get("examMode"):
+            merged["examMode"] = True
+            if not merged["examUrl"] and c.get("examUrl"):
+                merged["examUrl"] = c.get("examUrl")
+        for u in (c.get("allowlist") or []): allow.add(u)
+    merged["allowlist"] = sorted(list(allow))
+    return merged
+
+@app.route("/api/students", methods=["GET","POST"])
+def api_students():
+    data = _ensure_sessions_students(load_data())
+    if request.method == "GET":
+        return jsonify({"ok": True, "students": data["students"]})
+    body = request.json or {}
+    sid = body.get("id") or body.get("email") or _uuid.uuid4().hex
+    name = body.get("name") or ""
+    email = body.get("email", sid)
+    data["students"] = [s for s in data["students"] if s.get("id") != sid and s.get("email") != sid] + [{"id": sid, "name": name, "email": email}]
+    save_data(data)
+    return jsonify({"ok": True, "student": {"id": sid, "name": name, "email": email}})
+
+@app.route("/api/students/<sid>", methods=["GET","PUT","DELETE"])
+def api_student_item(sid):
+    data = _ensure_sessions_students(load_data())
+    if request.method == "GET":
+        for s in data["students"]:
+            if s.get("id") == sid or s.get("email") == sid:
+                return jsonify({"ok": True, "student": s})
+        return jsonify({"ok": False, "error": "not found"}), 404
+    if request.method == "DELETE":
+        data["students"] = [s for s in data["students"] if s.get("id") != sid and s.get("email") != sid]
+        save_data(data)
+        return jsonify({"ok": True, "deleted": sid})
+    body = request.json or {}
+    for s in data["students"]:
+        if s.get("id") == sid or s.get("email") == sid:
+            for k in ("name","email","id"):
+                if k in body: s[k] = body[k]
+            break
+    save_data(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/students/import", methods=["POST"])
+def api_students_import():
+    data = _ensure_sessions_students(load_data())
+    body = request.json or {}
+    arr = body.get("students") or []
+    norm = []
+    for s in arr:
+        sid = s.get("id") or s.get("email") or _uuid.uuid4().hex
+        norm.append({"id": sid, "name": s.get("name",""), "email": s.get("email", sid)})
+    data["students"] = norm
+    save_data(data)
+    return jsonify({"ok": True, "count": len(norm)})
+
+@app.route("/api/students/export", methods=["GET"])
+def api_students_export():
+    data = _ensure_sessions_students(load_data())
+    return jsonify({"students": data.get("students", [])})
+
+@app.route("/api/sessions", methods=["GET","POST"])
+def api_sessions():
+    data = _ensure_sessions_students(load_data())
+    if request.method == "GET":
+        data = _reconcile_active_sessions(data)
+        save_data(data)
+        return jsonify({"ok": True, "sessions": data.get("sessions", []), "active": data.get("active_sessions", [])})
+    body = request.json or {}
+    sess = {
+        "id": body.get("id") or ("sess_" + _uuid.uuid4().hex[:8]),
+        "name": body.get("name") or "New Session",
+        "teacher": body.get("teacher") or "",
+        "students": body.get("students") or [],
+        "controls": body.get("controls") or {"focusMode": False, "allowlist": [], "examMode": False, "examUrl": ""},
+        "schedule": body.get("schedule") or {"entries": []},
+        "manual": bool(body.get("manual", False))
+    }
+    data["sessions"] = [s for s in data.get("sessions", []) if s.get("id") != sess["id"]] + [sess]
+    save_data(data)
+    return jsonify({"ok": True, "session": sess})
+
+@app.route("/api/sessions/<sid>", methods=["GET","PUT","DELETE"])
+def api_session_item(sid):
+    data = _ensure_sessions_students(load_data())
+    if request.method == "GET":
+        for s in data.get("sessions", []):
+            if s.get("id") == sid:
+                return jsonify({"ok": True, "session": s, "active": sid in data.get("active_sessions", [])})
+        return jsonify({"ok": False, "error": "not found"}), 404
+    if request.method == "DELETE":
+        data["sessions"] = [s for s in data.get("sessions", []) if s.get("id") != sid]
+        data["active_sessions"] = [x for x in data.get("active_sessions", []) if x != sid]
+        save_data(data)
+        return jsonify({"ok": True, "deleted": sid})
+    body = request.json or {}
+    for s in data.get("sessions", []):
+        if s.get("id") == sid:
+            for k in ("name","teacher","students","controls","schedule","manual"):
+                if k in body: s[k] = body[k]
+            break
+    save_data(data)
+    return jsonify({"ok": True})
+
+@app.route("/api/sessions/<sid>/start", methods=["POST"])
+def api_session_start(sid):
+    data = _ensure_sessions_students(load_data())
+    if sid not in [s.get("id") for s in data.get("sessions", [])]:
+        return jsonify({"ok": False, "error": "not found"}), 404
+    act = set(data.get("active_sessions", []))
+    act.add(sid)
+    data["active_sessions"] = list(act)
+    for s in data.get("sessions", []):
+        if s.get("id") == sid: s["manual"] = True
+    save_data(data)
+    return jsonify({"ok": True, "active": data["active_sessions"]})
+
+@app.route("/api/sessions/<sid>/end", methods=["POST"])
+def api_session_end(sid):
+    data = _ensure_sessions_students(load_data())
+    data["active_sessions"] = [x for x in data.get("active_sessions", []) if x != sid]
+    for s in data.get("sessions", []):
+        if s.get("id") == sid: s["manual"] = False
+    save_data(data)
+    return jsonify({"ok": True, "active": data["active_sessions"]})
+
+@app.route("/api/sessions/active", methods=["GET"])
+def api_sessions_active():
+    data = _ensure_sessions_students(load_data())
+    data = _reconcile_active_sessions(data)
+    save_data(data)
+    return jsonify({"ok": True, "active": data.get("active_sessions", [])})
+
+@app.route("/api/state/<student_id>", methods=["GET"])
+def api_state_for_student(student_id):
+    data = _ensure_sessions_students(load_data())
+    merged = _effective_state_for_student(data, student_id)
+    return jsonify({"ok": True, "student_id": student_id, "state": merged})
+
+# === END SESSIONS/STUDENTS API ADDED ===
+
 # =========================
 # Run
 # =========================
