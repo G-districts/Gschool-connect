@@ -1,5 +1,5 @@
 # =========================
-# G-SCHOOLS CONNECT BACKEND
+# G-SCHOOLS CONNECT BACKEND (updated)
 # =========================
 
 from flask import Flask, request, jsonify, render_template, session, redirect, url_for, g
@@ -295,9 +295,7 @@ def _clean_room(room):
     if not r: return
     # drop stale viewers (> 10 minutes inactivity)
     now = int(time.time())
-    for cid in list(r["offers"].keys()):
-        # if no answer & offer older than 10 min, drop
-        pass
+    # (kept minimal; offers do not store timestamps currently)
     r["updated"] = now
 
 @app.route("/teacher/present")
@@ -765,8 +763,29 @@ def api_commands(student):
 
 
 # =========================
-# Off-task Check (simple)
+# Off-task Check (simple)  — FIXED to use current scene & class allowlist
 # =========================
+def _effective_allowlist_for_policy():
+    """Compute the effective allowlist based on class settings and current scene."""
+    d = ensure_keys(load_data())
+    cls = d["classes"]["period1"]
+    allowlist = list(cls.get("allowlist", []))
+    scenes = _load_scenes()
+    current = scenes.get("current") or None
+    if current:
+        # find full scene object
+        scene_obj = None
+        for bucket in ("allowed", "blocked"):
+            for s in scenes.get(bucket, []):
+                if str(s.get("id")) == str(current.get("id")):
+                    scene_obj = s
+                    break
+            if scene_obj:
+                break
+        if scene_obj and scene_obj.get("type") == "allowed":
+            allowlist = list(scene_obj.get("allow", []))
+    return allowlist
+
 @app.route("/api/offtask/check", methods=["POST"])
 def api_offtask_check():
     b = request.json or {}
@@ -776,9 +795,12 @@ def api_offtask_check():
         return jsonify({"ok": False}), 400
 
     d = ensure_keys(load_data())
-    # allowlist from policy (scene) if any
+
+    # Build allowlist domains from effective policy
+    allow_patterns = _effective_allowlist_for_policy()
     scene_allowed = set()
-    for patt in (d.get("policy", {}).get("allowlist") or []):
+    for patt in (allow_patterns or []):
+        # match patterns like *://*.example.com/*
         m = re.match(r"\*\:\/\/\*\.(.+?)\/\*", patt)
         if m:
             scene_allowed.add(m.group(1).lower())
@@ -1307,36 +1329,29 @@ def api_dm_me():
 
 @app.route("/api/dm/<student>", methods=["GET"])
 def api_dm_get(student):
+    """Return the DM thread for a student from the sqlite store (aligns with /api/dm/me)."""
     u = current_user()
     if not u:
         return jsonify({"ok": False, "error": "forbidden"}), 403
-    d = ensure_keys(load_data())
-    msgs = d.get("dm", {}).get(student, [])[-200:]
+    con = db(); cur = con.cursor()
+    cur.execute("SELECT user_id,role,text,ts FROM chat_messages WHERE room=? ORDER BY ts ASC", (f"dm:{student}",))
+    msgs = [{"from": r[1], "user": r[0], "text": r[2], "ts": r[3]} for r in cur.fetchall()]
+    con.close()
     return jsonify({"messages": msgs})
 
 @app.route("/api/dm/unread", methods=["GET"])
 def api_dm_unread():
-    d = ensure_keys(load_data())
-    out = {}
-    for student, msgs in d.get("dm", {}).items():
-        out[student] = sum(1 for m in msgs if m.get("from") == "student" and m.get("unread", True))
-    return jsonify(out)
+    # Simple stub (no unread tracking in sqlite); return empty counts.
+    return jsonify({})
 
 @app.route("/api/dm/mark_read", methods=["POST"])
 def api_dm_mark_read():
-    body = request.json or {}
-    student = body.get("student")
-    d = ensure_keys(load_data())
-    if student in d.get("dm", {}):
-        for m in d["dm"][student]:
-            if m.get("from") == "student":
-                m["unread"] = False
-        save_data(d)
+    # No-op with sqlite-backed storage (unread not tracked); succeed to satisfy clients.
     return jsonify({"ok": True})
 
 
 # =========================
-# Attention Check (SESSION-ONLY)
+# Attention Check (SESSION-ONLY)  — FIXED to persist state/responses
 # =========================
 @app.route("/api/attention_check", methods=["POST"])
 def api_attention_check():
@@ -1355,8 +1370,19 @@ def api_attention_check():
     if sid not in _active_session_ids(d):
         return jsonify({"ok": False, "error": "session not active"}), 409
 
-    cmd = {"type": "attention_check", "title": title, "timeout": timeout, "session_id": sid, "ts": int(time.time())}
+    ts_now = int(time.time())
+    cmd = {"type": "attention_check", "title": title, "timeout": timeout, "session_id": sid, "ts": ts_now}
     d = _enqueue_session_cmd(d, sid, cmd)
+
+    # Persist current attention check state
+    d["attention_check"] = {
+        "title": title,
+        "timeout": timeout,
+        "session_id": sid,
+        "started": ts_now,
+        "responses": {}
+    }
+
     save_data(d)
     log_action({"event": "attention_check_start", "title": title, "session": sid})
     return jsonify({"ok": True})
@@ -1370,7 +1396,9 @@ def api_attention_response():
     check = d.get("attention_check")
     if not check:
         return jsonify({"ok": False, "error": "no active check"}), 400
+    check.setdefault("responses", {})
     check["responses"][student] = {"response": response, "ts": int(time.time())}
+    d["attention_check"] = check
     save_data(d)
     log_action({"event": "attention_response", "student": student, "response": response})
     return jsonify({"ok": True})
