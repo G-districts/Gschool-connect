@@ -1811,6 +1811,42 @@ def teacher_sessions_page():
         return render_template("sessions.html")
     except Exception as e:
         return f"Template load error: {e}", 500
+
+# -------------------------------
+# Teacher: Session-specific board
+# -------------------------------
+@app.route("/teacher/session/<sid>")
+def teacher_session_board(sid):
+    try:
+        return render_template("session_control.html", sid=sid)
+    except Exception as e:
+        return f"Template load error: {e}", 500
+
+# ----------------------------------------------
+# Teacher Session View: reuse teacher.html, lock
+# ----------------------------------------------
+@app.route("/teacher/session/<sid>")
+def teacher_session_locked(sid):
+    # Load teacher.html and inject a session lock script before </body>
+    try:
+        from flask import Response
+        tpl_path = os.path.join(app.template_folder, "teacher.html")
+        with open(tpl_path, "r", encoding="utf-8") as f:
+            html = f.read()
+        inject = f'''
+<script>
+window.__SESSION_LOCK__ = true;
+window.__SESSION_ID__ = "{sid}";
+</script>
+<script src="/static/teacher_session_lock.js"></script>
+'''
+        if "</body>" in html:
+            html = html.replace("</body>", inject + "</body>")
+        else:
+            html = html + inject
+        return Response(html, mimetype="text/html")
+    except Exception as e:
+        return f"Failed to render locked teacher session: {e}", 500
 # =========================
 # Run
 # =========================
