@@ -2,7 +2,7 @@
 # G-SCHOOLS CONNECT BACKEND
 # =========================
 
-from flask import Flask, request, jsonify, render_template, session, redirect, url_for
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, g
 from flask_cors import CORS
 import json, os, time, sqlite3, traceback, uuid, re
 from urllib.parse import urlparse
@@ -1812,15 +1812,6 @@ def teacher_sessions_page():
     except Exception as e:
         return f"Template load error: {e}", 500
 
-# -------------------------------
-# Teacher: Session-specific board
-# -------------------------------
-@app.route("/teacher/session/<sid>")
-def teacher_session_board(sid):
-    try:
-        return render_template("session_control.html", sid=sid)
-    except Exception as e:
-        return f"Template load error: {e}", 500
 
 # ----------------------------------------------
 # Teacher Session View: reuse teacher.html, lock
@@ -1847,6 +1838,86 @@ window.__SESSION_ID__ = "{sid}";
         return Response(html, mimetype="text/html")
     except Exception as e:
         return f"Failed to render locked teacher session: {e}", 500
+
+# === SESSION LOCK INJECTION & ENFORCEMENT ===
+from io import BytesIO
+
+@app.before_request
+def _session_scoping_before():
+    # Capture session id from query or header
+    g._session_id = request.args.get('session') or request.headers.get('X-Session-ID')
+    g._session_students = set()
+    if g._session_id:
+        try:
+            store = ensure_keys(load_data())
+            for s in store.get("sessions", []):
+                if s.get("id") == g._session_id:
+                    g._session_students = set(s.get("students") or [])
+                    break
+        except Exception:
+            pass
+    # For POST/PUT JSON bodies with a students array, intersect with session students
+    if getattr(g, '_session_id', None) and request.method in ('POST','PUT'):
+        try:
+            if request.is_json:
+                body = request.get_json(silent=True) or {}
+                if isinstance(body, dict) and isinstance(body.get('students'), list):
+                    body['students'] = [x for x in body['students'] if x in g._session_students]
+                    data = json.dumps(body).encode('utf-8')
+                    request._cached_data = data
+                    request.environ['wsgi.input'] = BytesIO(data)
+                    request.environ['CONTENT_LENGTH'] = str(len(data))
+        except Exception:
+            pass
+
+@app.after_request
+def _session_scoping_after(resp):
+    # Inject lock script into teacher.html when ?session=SID is present
+    try:
+        if request.path.rstrip('/') == '/teacher' and request.args.get('session') and resp.mimetype and resp.mimetype.startswith('text/html'):
+            sid = request.args.get('session')
+            inject = f"""
+<script>
+window.__SESSION_LOCK__ = true;
+window.__SESSION_ID__ = "{sid}";
+</script>
+<script src="/static/teacher_session_lock.js"></script>
+"""
+            text = resp.get_data(as_text=True)
+            if '</body>' in text:
+                text = text.replace('</body>', inject + '</body>')
+                resp.set_data(text)
+    except Exception:
+        pass
+
+    # Server-side filter for JSON responses on common endpoints
+    try:
+        if getattr(g, '_session_id', None) and resp.mimetype == 'application/json':
+            paths = ('/api/presence', '/api/commands', '/api/timeline', '/api/heartbeat', '/api/offtask')
+            if request.path.startswith(paths):
+                data = json.loads(resp.get_data(as_text=True) or 'null')
+                def _filter(obj):
+                    if isinstance(obj, list):
+                        out = []
+                        for x in obj:
+                            sidv = None
+                            if isinstance(x, dict):
+                                sidv = x.get('id') or x.get('email') or x.get('student') or x.get('user')
+                            if sidv is None:
+                                out.append(_filter(x))
+                            else:
+                                if sidv in g._session_students:
+                                    out.append(_filter(x))
+                        return out
+                    if isinstance(obj, dict):
+                        return {k: _filter(v) for k,v in obj.items()}
+                    return obj
+                filtered = _filter(data)
+                resp.set_data(json.dumps(filtered))
+    except Exception:
+        pass
+    return resp
+# === END SESSION LOCK INJECTION & ENFORCEMENT ===
 # =========================
 # Run
 # =========================
