@@ -1,0 +1,75 @@
+
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Session Control • {{ sid }}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin:0; background:#fafafa; }
+    header { display:flex; justify-content:space-between; align-items:center; padding:14px 18px; background:#111827; color:#fff; }
+    header a { color:#93c5fd; text-decoration:none; }
+    main { max-width:1100px; margin: 16px auto; padding: 0 16px 60px; }
+    .grid { display:grid; grid-template-columns: 360px 1fr; gap:20px; align-items:start; }
+    .card { background:#fff; border:1px solid #e5e7eb; border-radius:12px; box-shadow: 0 2px 8px rgba(0,0,0,.04); }
+    .card h2 { font-size:16px; padding:14px 16px; margin:0; border-bottom:1px solid #e5e7eb; }
+    .card .body { padding:14px 16px; }
+    .row { display:flex; gap:10px; align-items:center; }
+    label { display:block; font-size:12px; color:#374151; margin-top:8px; }
+    input[type=text], textarea { width:100%; box-sizing:border-box; padding:10px; border:1px solid #d1d5db; border-radius:8px; background:#fff; }
+    .pill { padding:4px 8px; border-radius:999px; font-size:12px; border:1px solid #d1d5db; }
+    .pill.ok { background:#ecfdf5; color:#065f46; border-color:#a7f3d0; }
+    .pill.off { background:#f3f4f6; color:#374151; }
+    .btn { display:inline-flex; align-items:center; gap:6px; background:#111827; color:#fff; border:none; padding:10px 14px; border-radius:10px; cursor:pointer; }
+    .btn.secondary { background:#4b5563; }
+    .btn.danger { background:#b91c1c; }
+    .list { list-style:none; padding:0; margin:0; }
+    .item { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; border-bottom:1px solid #f3f4f6; }
+    .muted { color:#6b7280; }
+    .allowlist { min-height:80px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <div style="font-weight:600;">Class Session • <span id="sessionName">{{ sid }}</span></div>
+      <div class="muted" style="font-size:12px">Only affects students enrolled in this session.</div>
+    </div>
+    <div class="row">
+      <a href="/teacher/sessions">← All Sessions</a>
+      <span id="statusPill" class="pill off">Inactive</span>
+      <button id="startBtn" class="btn">Start</button>
+      <button id="endBtn" class="btn secondary">End</button>
+    </div>
+  </header>
+  <main>
+    <div class="grid">
+      <div class="card">
+        <h2>Controls (this session only)</h2>
+        <div class="body">
+          <label><input id="ctl_focus" type="checkbox" /> Focus mode</label>
+          <label>Allowlist (one per line)</label>
+          <textarea id="ctl_allowlist" class="allowlist" placeholder="*://*.khanacademy.org/*&#10;*://*.desmos.com/*"></textarea>
+          <label><input id="ctl_exam" type="checkbox" /> Exam mode</label>
+          <label>Exam URL</label>
+          <input id="ctl_examurl" type="text" placeholder="https://exam.school.org/..." />
+          <div class="row" style="margin-top:12px;">
+            <button id="saveCtl" class="btn">Save Controls</button>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>Students in this session</h2>
+        <div class="body">
+          <ul id="studentsList" class="list"></ul>
+          <div class="muted" style="font-size:12px;margin-top:8px">Students not listed here are not affected by these controls.</div>
+        </div>
+      </div>
+    </div>
+  </main>
+  <script>
+    window.__SESSION_ID__ = "{{ sid }}";
+  </script>
+  <script src="/static/session_control.js"></script>
+</body>
+</html>
