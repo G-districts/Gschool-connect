@@ -145,9 +145,12 @@ async function init() {
     const btn = e.target.closest('button');
     if (!btn) return;
     const id = btn.dataset.id;
-    if (btn.classList.contains('startstop')) {
+    if (btn.classList.contains('startstop')) { /* open board after starting */
       // determine current label
       if (btn.textContent==='Start') {
+        await api(`/api/sessions/${encodeURIComponent(id)}/start`, {method:'POST'});
+        window.location.href = `/teacher/session/${id}`;
+        return;
         await api(`/api/sessions/${encodeURIComponent(id)}/start`, {method:'POST'});
       } else {
         await api(`/api/sessions/${encodeURIComponent(id)}/end`, {method:'POST'});
