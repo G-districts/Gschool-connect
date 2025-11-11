@@ -317,6 +317,12 @@ def api_present_end(room):
     PRESENT[room] = {"offers": {}, "answers": {}, "cand_v": defaultdict(list), "cand_t": defaultdict(list), "updated": int(time.time()), "active": False}
     return jsonify({"ok": True})
 
+@app.route("/api/present/<room>/status", methods=["GET"])
+def api_present_status(room):
+    room = re.sub(r'[^a-zA-Z0-9_-]+', '', room)
+    r = PRESENT.get(room) or {}
+    return jsonify({"ok": True, "active": bool(r.get("active"))})
+
 # Viewer posts offer and polls for answer
 @app.route("/api/present/<room>/viewer/offer", methods=["POST"])
 def api_present_viewer_offer(room):
