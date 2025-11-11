@@ -1801,6 +1801,16 @@ def api_state_for_student(student_id):
 
 # === END SESSIONS/STUDENTS API ADDED ===
 
+
+# -------------------------------
+# Teacher Sessions Console (HTML)
+# -------------------------------
+@app.route("/teacher/sessions")
+def teacher_sessions_page():
+    try:
+        return render_template("sessions.html")
+    except Exception as e:
+        return f"Template load error: {e}", 500
 # =========================
 # Run
 # =========================
