@@ -922,11 +922,19 @@ def api_heartbeat():
 
     save_data(d)
 
+    # NEW: surface active sessions + merged effective state for this student
+    active_for_student = _student_active_sessions(d, student) if student else []
+    effective = _effective_state_for_student(d, student) if student else {}
+
     return jsonify({
         "ok": True,
         "server_time": int(time.time()),
         # Honor global kill switch but also keep guest lockout enforced above.
-        "extension_enabled": bool(extension_enabled_global)
+        "extension_enabled": bool(extension_enabled_global),
+        "sessions": {
+            "active_for_student": active_for_student,
+            "effective_state": effective
+        }
     })
 
 @app.route("/api/presence")
@@ -1011,6 +1019,9 @@ def api_policy():
                 # add extra teacher block patterns
                 teacher_blocks = (teacher_blocks or []) + list(scene_obj.get("block", []))
 
+    # NEW: sessions info for the extension
+    active_for_student = _student_active_sessions(d, student) if student else []
+
     resp = {
         "blocked_redirect": d.get("settings", {}).get("blocked_redirect", "https://blocked.gdistrict.org/Gschool%20block"),
         "categories": d.get("categories", {}),
@@ -1027,7 +1038,10 @@ def api_policy():
         "chat_enabled": d.get("settings", {}).get("chat_enabled", False),
         "pending": pending,
         "ts": int(time.time()),
-        "scenes": {"current": current}
+        "scenes": {"current": current},
+        "sessions": {
+            "active_for_student": active_for_student
+        }
     }
     return jsonify(resp)
 
