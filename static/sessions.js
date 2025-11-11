@@ -149,7 +149,7 @@ async function init() {
       // determine current label
       if (btn.textContent==='Start') {
         await api(`/api/sessions/${encodeURIComponent(id)}/start`, {method:'POST'});
-        window.location.href = `/teacher/session/${id}`;
+        window.location.href = `/teacher?session=${id}`;
         return;
         await api(`/api/sessions/${encodeURIComponent(id)}/start`, {method:'POST'});
       } else {
