@@ -91,5 +91,22 @@ start().catch(err => {
 // Show stop screen when stream ends
 video.addEventListener('ended', () => showEmpty(true));
 </script>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+const nsp = (() => { try { return io('/present', { transports: ['websocket','polling'] }); } catch(e){ return null; } })();
+var client_id_global = client_id;
+if (nsp){
+  nsp.emit('join', { room });
+  nsp.on('teacher:answer', async ({client_id, sdp}) => {
+    if (client_id !== client_id_global) return;
+    try { await pc.setRemoteDescription(sdp); } catch(e){}
+  });
+  nsp.on('ice:teacher', async ({client_id, candidate}) => {
+    if (client_id !== client_id_global) return;
+    if (candidate){ try { await pc.addIceCandidate(candidate); } catch(e){} }
+  });
+}
+</script>
 </body>
 </html>
