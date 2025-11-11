@@ -320,7 +320,76 @@
   }
 </script>
 
-<!-- ===== Scene Editor (was missing; now added) ===== -->
+<!-- ===== Roster/session filter (NEW) ===== -->
+<script>
+  // Class/session roster — used to filter UI
+  let CLASS_ID = null;
+  let CLASS_ROSTER = null;     // Set<string>
+  let SESSION_ROSTER = null;   // Set<string>
+
+  // Show only if the id is in current class/session
+  function inSession(id){
+    const key = String(id || '').toLowerCase();
+    if (CLASS_ROSTER)   return CLASS_ROSTER.has(key);
+    if (SESSION_ROSTER) return SESSION_ROSTER.has(key);
+    return true; // if nothing is known, don't hide anyone
+  }
+
+  // Prefer: /api/class/set -> /api/class/:id/roster -> /api/sessions/:id
+  async function _loadFromClassSet(){
+    try{
+      const j = await (await fetch('/api/class/set', { method:'GET' })).json();
+      const cls = j.class || {};
+      CLASS_ID = cls.id || cls.class_id || CLASS_ID || 'period1';
+      const emails = cls.students || cls.roster || cls.emails || cls.roster_emails || [];
+      if (emails && emails.length){
+        CLASS_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
+      }
+    }catch(_){}
+  }
+
+  async function _loadFromClassRosterEndpoint(){
+    if (!CLASS_ID) return;
+    try{
+      const r = await fetch(`/api/class/${encodeURIComponent(CLASS_ID)}/roster`);
+      if (!r.ok) return;
+      const j = await r.json();
+      const emails = j.students || j.roster || j.emails || j.roster_emails || [];
+      if (emails && emails.length){
+        CLASS_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
+      }
+    }catch(_){}
+  }
+
+  async function _loadFromSession(){
+    if (!SESSION_ID) return;
+    try{
+      const j = await (await fetch(`/api/sessions/${encodeURIComponent(SESSION_ID)}`)).json();
+      const emails =
+        (j.session && (j.session.students || j.session.roster || j.session.emails)) ||
+        j.students || j.roster || j.emails || [];
+      if (emails && emails.length){
+        SESSION_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
+      }
+    }catch(_){}
+  }
+
+  // Bootstrap once, then refresh occasionally (optional)
+  (async function bootstrapRoster(){
+    await _loadFromClassSet();
+    if (!CLASS_ROSTER) await _loadFromClassRosterEndpoint();
+    if (!CLASS_ROSTER) await _loadFromSession();
+
+    // Refresh every 20s in case roster changes (safe to remove if not needed)
+    setInterval(async ()=>{
+      await _loadFromClassSet();
+      if (!CLASS_ROSTER) await _loadFromClassRosterEndpoint();
+      if (!CLASS_ROSTER) await _loadFromSession();
+    }, 20000);
+  })();
+</script>
+
+<!-- ===== Scene Editor (unchanged) ===== -->
 <dialog id="sceneDlg">
   <h4 id="sceneDlgTitle">Create Scene</h4>
   <label>Name <input id="sceneName" placeholder="e.g. Math Practice"></label>
@@ -505,7 +574,7 @@ async function loadData(){
 loadData();
 
 /* -----------------------------------------------------------
-   Presence refresh & grid render
+   Presence refresh & grid render (FILTERED)
 ----------------------------------------------------------- */
 async function refreshPresence(){
   const res = await fetch('/api/presence'); if(!res.ok) return;
@@ -538,7 +607,10 @@ async function refreshPresence(){
   }
 
   const grid = $('#screenGrid'); grid.innerHTML='';
-  const allIds = Array.from(new Set([...Object.keys(studentCache), ...Object.keys(pres)])).sort();
+  const allIds = Array
+    .from(new Set([...Object.keys(studentCache), ...Object.keys(pres)]))
+    .filter(inSession)   // ← only class/session students
+    .sort();
 
   allIds.forEach(student=>{
     const info = pres[student] || {};
@@ -750,9 +822,12 @@ async function loadStudentsIntoSelect(){
   try{
     const p = await (await fetch('/api/presence')).json();
     const sel = $('#studentSelect'); sel.innerHTML = '';
-    Object.keys(p||{}).sort().forEach(id=>{
-      const opt = document.createElement('option'); opt.value=id; opt.textContent=id; sel.appendChild(opt);
-    });
+    Object.keys(p||{})
+      .filter(inSession)   // ← only class/session members
+      .sort()
+      .forEach(id=>{
+        const opt = document.createElement('option'); opt.value=id; opt.textContent=id; sel.appendChild(opt);
+      });
   }catch(e){}
 }
 setInterval(loadStudentsIntoSelect, 5000); loadStudentsIntoSelect();
@@ -1057,7 +1132,7 @@ loadScenes();
     try{
       const res = await fetch('/api/presence'); if(!res.ok) return;
       const pres = await res.json();
-      const ids = Object.keys(pres||{}).sort();
+      const ids = Object.keys(pres||{}).filter(inSession).sort(); // ← filtered
       for(const elId of ['tlStudent', 'shStudent']){
         const sel = document.getElementById(elId);
         if(!sel) continue;
