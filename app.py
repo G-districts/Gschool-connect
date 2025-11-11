@@ -76,14 +76,20 @@ def _safe_default_data():
             }
         },
         "categories": {},
-        "pending_commands": {},
+        "pending_commands": {},       # legacy (kept for compatibility but no longer used for broadcast)
         "pending_per_student": {},
+        "pending_by_session": {},     # NEW: session-scoped command queues
         "presence": {},
         "history": {},
         "screenshots": {},
         "dm": {},
         "alerts": [],
-        "audit": []
+        "audit": [],
+        # sessions engine storage (already used below)
+        "students": [],
+        "sessions": [],
+        "active_sessions": [],
+        "extension_enabled": True
     }
 
 def _coerce_to_dict(obj):
@@ -171,14 +177,18 @@ def ensure_keys(d):
     d.setdefault("categories", {})
     d.setdefault("pending_commands", {})
     d.setdefault("pending_per_student", {})
+    d.setdefault("pending_by_session", {})  # NEW
     d.setdefault("presence", {})
     d.setdefault("history", {})
     d.setdefault("screenshots", {})
     d.setdefault("alerts", [])
     d.setdefault("dm", {})
     d.setdefault("audit", [])
-    # also carry feature flags
     d.setdefault("extension_enabled", True)
+    # sessions engine storage
+    d.setdefault("students", [])
+    d.setdefault("sessions", [])
+    d.setdefault("active_sessions", [])
     return d
 
 def log_action(entry):
@@ -468,6 +478,7 @@ def api_categories_delete():
 # =========================
 @app.route("/api/announce", methods=["POST"])
 def api_announce():
+    # NOTE: kept as a global setting; does not push commands
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -512,13 +523,7 @@ def api_class_set():
 
     d["classes"]["period1"] = cls
 
-    if bool(cls.get("active", True)) and not prev_active:
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({
-            "type": "notify",
-            "title": "Class session is active",
-            "message": "Please join and stay until dismissed."
-        })
-
+    # No more global notify via "*" here.
     save_data(d)
     log_action({"event": "class_set", "active": cls.get("active", True)})
     return jsonify({"ok": True, "class": cls, "settings": d["settings"]})
@@ -545,47 +550,217 @@ def api_class_toggle():
 
 
 # =========================
-# Commands
+# --- Session helpers (NEW) ---
+# =========================
+def _ensure_sessions_students(store):
+    store = ensure_keys(store)
+    if "students" not in store or not isinstance(store.get("students"), list):
+        store["students"] = []
+    if "sessions" not in store or not isinstance(store.get("sessions"), list):
+        store["sessions"] = []
+    if "active_sessions" not in store or not isinstance(store.get("active_sessions"), list):
+        store["active_sessions"] = []
+    if "pending_by_session" not in store or not isinstance(store.get("pending_by_session"), dict):
+        store["pending_by_session"] = {}
+    return store
+
+def _reconcile_active_sessions(store):
+    store = _ensure_sessions_students(store)
+    sessions_by_id = {s.get("id"): s for s in store.get("sessions", [])}
+    active = set(store.get("active_sessions", []))
+    for sid, sess in sessions_by_id.items():
+        if _session_is_scheduled_active(sess):
+            active.add(sid)
+        else:
+            if sid in active and not sess.get("manual", False):
+                active.discard(sid)
+    store["active_sessions"] = list(active)
+    return store
+
+def _active_session_ids(store):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    return set(store.get("active_sessions", []))
+
+def _student_active_sessions(store, student_id):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    act = _active_session_ids(store)
+    return [s.get("id") for s in store.get("sessions", []) if s.get("id") in act and student_id in (s.get("students") or [])]
+
+def _enqueue_session_cmd(store, sid, cmd):
+    """Append a command into a session queue (cap length)."""
+    store = _ensure_sessions_students(store)
+    q = store.setdefault("pending_by_session", {}).setdefault(sid, [])
+    q.append(cmd)
+    if len(q) > 200:
+        del q[:-200]
+    return store
+
+def _weekly_match(entry, now_local=None):
+    try:
+        import datetime as _dt
+        now = now_local or _dt.datetime.now()
+        weekday = now.weekday()
+        if weekday not in (entry.get("days") or []):
+            return False
+        sh, sm = [int(x) for x in str(entry.get("start","00:00")).split(":")]
+        eh, em = [int(x) for x in str(entry.get("end","23:59")).split(":")]
+        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
+        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
+        return start_dt <= now <= end_dt
+    except Exception:
+        return False
+
+def _oneoff_match(entry, now_ts=None):
+    try:
+        from datetime import datetime
+        now_ts = now_ts or time.time()
+        def parse_iso(s):
+            if not s: return None
+            s = s.replace("Z","+00:00") if s.endswith("Z") else s
+            return datetime.fromisoformat(s)
+        s = parse_iso(entry.get("startISO"))
+        e = parse_iso(entry.get("endISO"))
+        return s and e and (s.timestamp() <= now_ts <= e.timestamp())
+    except Exception:
+        return False
+
+def _session_is_scheduled_active(sess):
+    sch = (sess or {}).get("schedule") or {}
+    entries = sch.get("entries") or []
+    for ent in entries:
+        t = ent.get("type")
+        if t == "weekly" and _weekly_match(ent):
+            return True
+        if t == "oneoff" and _oneoff_match(ent):
+            return True
+    return False
+
+def _effective_state_for_student(store, student_id):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    sessions = store.get("sessions", [])
+    active_ids = set(store.get("active_sessions", []))
+    relevant = [s for s in sessions if s.get("id") in active_ids and student_id in (s.get("students") or [])]
+    merged = {"focusMode": False, "allowlist": [], "examMode": False, "examUrl": "", "session_ids": [s.get("id") for s in relevant]}
+    allow = set()
+    for s in relevant:
+        c = s.get("controls") or {}
+        if c.get("focusMode"): merged["focusMode"] = True
+        if c.get("examMode"):
+            merged["examMode"] = True
+            if not merged["examUrl"] and c.get("examUrl"):
+                merged["examUrl"] = c.get("examUrl")
+        for u in (c.get("allowlist") or []): allow.add(u)
+    merged["allowlist"] = sorted(list(allow))
+    return merged
+
+
+# =========================
+# Commands  (SESSION-SCOPED)
 # =========================
 @app.route("/api/command", methods=["POST"])
 def api_command():
+    """
+    Teacher/admin sends a command to a session (required) or a specific student (optional),
+    but the command is only queued if the session is ACTIVE. No global broadcast.
+    """
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
-    d = ensure_keys(load_data())
+
+    d = _ensure_sessions_students(load_data())
     b = request.json or {}
-    target = b.get("student") or "*"
+
+    # Session required
+    sid = b.get("session") or b.get("session_id")
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+
+    # Must be active
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
+
     cmd = b.get("command")
     if not cmd or "type" not in cmd:
         return jsonify({"ok": False, "error": "invalid"}), 400
-    d.setdefault("pending_commands", {}).setdefault(target, []).append(cmd)
+
+    # stamp session id inside the command so SW can double check
+    cmd = dict(cmd)
+    cmd["session_id"] = sid
+    cmd["ts"] = int(time.time())
+
+    # If student targeted, we still put into session queue (SW will also verify enrollment)
+    target_student = (b.get("student") or "").strip()
+    d = _enqueue_session_cmd(d, sid, cmd)
+
+    # Also allow explicit per-student queue (session-stamped) if provided
+    if target_student:
+        pend = d.setdefault("pending_per_student", {})
+        arr = pend.setdefault(target_student, [])
+        arr.append(dict(cmd))
+        arr[:] = arr[-50:]
+
     save_data(d)
-    log_action({"event": "command", "target": target, "type": cmd.get("type")})
+    log_action({"event": "command", "target": target_student or f"session:{sid}", "type": cmd.get("type")})
     return jsonify({"ok": True})
 
 @app.route("/api/commands/<student>", methods=["GET", "POST"])
 def api_commands(student):
-    d = ensure_keys(load_data())
+    d = _ensure_sessions_students(load_data())
 
     if request.method == "GET":
-        cmds = d["pending_commands"].get(student, []) + d["pending_commands"].get("*", [])
-        d["pending_commands"][student] = []
-        d["pending_commands"]["*"] = []
-        save_data(d)
-        return jsonify({"commands": cmds})
+        # Deliver only:
+        #  - per-student commands (one-shot), and
+        #  - commands queued for any ACTIVE session that includes this student.
+        out = []
 
-    # POST (push from teacher)
+        # Per-student one-shots
+        per_stu = d.get("pending_per_student", {}).get(student, [])
+        if per_stu:
+            out.extend(per_stu)
+            d["pending_per_student"][student] = []
+
+        # Session-scoped: for each active session containing this student
+        active_sids = _student_active_sessions(d, student)
+        pbs = d.get("pending_by_session", {})
+        for sid in active_sids:
+            queue = pbs.get(sid, [])
+            if queue:
+                # Keep only those commands stamped with the same sid (paranoia)
+                to_take = [c for c in queue if str(c.get("session_id")) == str(sid)]
+                out.extend(to_take)
+                # Remove delivered ones from the queue
+                remaining = [c for c in queue if c not in to_take]
+                pbs[sid] = remaining
+
+        # (Legacy) Completely ignore global pending_commands["*"] and per-student pending_commands here.
+
+        save_data(d)
+        return jsonify({"commands": out})
+
+    # POST (push from teacher) — must be session-scoped, same rules as /api/command
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
 
     b = request.json or {}
+    sid = b.get("session") or b.get("session_id")
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
+
     if not b.get("type"):
         return jsonify({"ok": False, "error": "missing type"}), 400
 
-    d["pending_commands"].setdefault(student, []).append(b)
+    cmd = dict(b)
+    cmd["session_id"] = sid
+    cmd["ts"] = int(time.time())
+
+    d = _enqueue_session_cmd(d, sid, cmd)
+    # Also tuck into per-student if URL path provides a student id (it does)
+    d.setdefault("pending_per_student", {}).setdefault(student, []).append(dict(cmd))
     save_data(d)
-    log_action({"event": "command_sent", "to": student, "cmd": b.get("type")})
+    log_action({"event": "command_sent", "to": student, "cmd": cmd.get("type"), "session": sid})
     return jsonify({"ok": True})
 
 
@@ -1028,6 +1203,7 @@ def api_scenes_import():
 
 @app.route("/api/scenes/apply", methods=["POST"])
 def api_scenes_apply():
+    # No command broadcast here; scenes affect /api/policy merge.
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -1062,11 +1238,6 @@ def api_scenes_apply():
     store["current"] = found
     _save_scenes(store)
     log_action({"event": "scene_applied", "scene": found})
-
-    # Push a refresh command to all students
-    d = ensure_keys(load_data())
-    d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "policy_refresh"})
-    save_data(d)
     return jsonify({"ok": True, "current": found})
 
 @app.route("/api/scenes/clear", methods=["POST"])
@@ -1165,24 +1336,29 @@ def api_dm_mark_read():
 
 
 # =========================
-# Attention Check
+# Attention Check (SESSION-ONLY)
 # =========================
 @app.route("/api/attention_check", methods=["POST"])
 def api_attention_check():
+    u = current_user()
+    if not u or u["role"] not in ("teacher", "admin"):
+        return jsonify({"ok": False, "error": "forbidden"}), 403
+
     body = request.json or {}
     title = body.get("title", "Are you paying attention?")
     timeout = int(body.get("timeout", 30))
+    sid = body.get("session") or body.get("session_id")
+    d = _ensure_sessions_students(load_data())
 
-    d = ensure_keys(load_data())
-    d["attention_check"] = {"title": title, "timeout": timeout, "ts": int(time.time()), "responses": {}}
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
 
-    d.setdefault("pending_commands", {}).setdefault("*", []).append({
-        "type": "attention_check",
-        "title": title,
-        "timeout": timeout
-    })
+    cmd = {"type": "attention_check", "title": title, "timeout": timeout, "session_id": sid, "ts": int(time.time())}
+    d = _enqueue_session_cmd(d, sid, cmd)
     save_data(d)
-    log_action({"event": "attention_check_start", "title": title})
+    log_action({"event": "attention_check_start", "title": title, "session": sid})
     return jsonify({"ok": True})
 
 @app.route("/api/attention_response", methods=["POST"])
@@ -1229,14 +1405,14 @@ def api_student_set():
 
 @app.route("/api/open_tabs", methods=["POST"])
 def api_open_tabs_alias():
+    # SESSION REQUIRED if not targeting a single student
     b = request.json or {}
     urls = b.get("urls") or []
     student = (b.get("student") or "").strip()
     if not urls:
         return jsonify({"ok": False, "error": "urls required"}), 400
 
-    d = load_data()
-    d.setdefault("pending_commands", {})
+    d = _ensure_sessions_students(load_data())
     if student:
         pend = d.setdefault("pending_per_student", {})
         arr = pend.setdefault(student, [])
@@ -1244,8 +1420,13 @@ def api_open_tabs_alias():
         arr[:] = arr[-50:]
         log_action({"event": "student_tabs", "student": student, "type": "open_tabs", "count": len(urls)})
     else:
-        d["pending_commands"].setdefault("*", []).append({"type": "open_tabs", "urls": urls, "ts": int(time.time())})
-        log_action({"event": "class_tabs", "target": "*", "type": "open_tabs", "count": len(urls)})
+        sid = b.get("session") or b.get("session_id")
+        if not sid:
+            return jsonify({"ok": False, "error": "session required"}), 400
+        if sid not in _active_session_ids(d):
+            return jsonify({"ok": False, "error": "session not active"}), 409
+        d = _enqueue_session_cmd(d, sid, {"type": "open_tabs", "urls": urls, "session_id": sid, "ts": int(time.time())})
+        log_action({"event": "class_tabs", "target": f"session:{sid}", "type": "open_tabs", "count": len(urls)})
     save_data(d)
     return jsonify({"ok": True})
 
@@ -1336,20 +1517,7 @@ def api_youtube_rules():
         set_setting("yt_block_channels", body.get("block_channels", []))
         set_setting("yt_allow", body.get("allow", []))
         set_setting("yt_allow_mode", bool(body.get("allow_mode", False)))
-
-        # Broadcast an update command to all present students
-        d = ensure_keys(load_data())
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({
-            "type": "update_youtube_rules",
-            "rules": {
-                "block_keywords": body.get("block_keywords", []),
-                "block_channels": body.get("block_channels", []),
-                "allow": body.get("allow", []),
-                "allow_mode": bool(body.get("allow_mode", False))
-            }
-        })
-        save_data(d)
-
+        # Do NOT broadcast here; SW will pull via /api/state if needed.
         log_action({"event": "youtube_rules_update"})
         return jsonify({"ok": True})
 
@@ -1398,7 +1566,7 @@ def api_save_overrides():
 
 
 # =========================
-# Poll
+# Poll (SESSION-ONLY)
 # =========================
 @app.route("/api/poll", methods=["POST"])
 def api_poll():
@@ -1408,16 +1576,20 @@ def api_poll():
     body = request.json or {}
     q = (body.get("question") or "").strip()
     opts = [o.strip() for o in (body.get("options") or []) if o and o.strip()]
+    sid = body.get("session") or body.get("session_id")
     if not q or not opts:
         return jsonify({"ok": False, "error": "question and options required"}), 400
+    d = _ensure_sessions_students(load_data())
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
+
     poll_id = "poll_" + str(int(time.time() * 1000))
-    d = ensure_keys(load_data())
     d.setdefault("polls", {})[poll_id] = {"question": q, "options": opts, "responses": []}
-    d.setdefault("pending_commands", {}).setdefault("*", []).append({
-        "type": "poll", "id": poll_id, "question": q, "options": opts
-    })
+    d = _enqueue_session_cmd(d, sid, {"type": "poll", "id": poll_id, "question": q, "options": opts, "session_id": sid, "ts": int(time.time())})
     save_data(d)
-    log_action({"event": "poll_create", "poll_id": poll_id})
+    log_action({"event": "poll_create", "poll_id": poll_id, "session": sid})
     return jsonify({"ok": True, "poll_id": poll_id})
 
 @app.route("/api/poll_response", methods=["POST"])
@@ -1459,7 +1631,7 @@ def api_state():
 
 
 # =========================
-# Student: open tabs (explicit)
+# Student: open tabs (explicit, SESSION-ONLY)
 # =========================
 @app.route("/api/student/open_tabs", methods=["POST"])
 def api_student_open_tabs():
@@ -1470,20 +1642,30 @@ def api_student_open_tabs():
     b = request.json or {}
     student = (b.get("student") or "").strip()
     urls = b.get("urls") or []
+    sid = b.get("session") or b.get("session_id")
+
     if not student or not urls:
         return jsonify({"ok": False, "error": "student and urls required"}), 400
 
-    d = load_data()
+    d = _ensure_sessions_students(load_data())
+    # if a session is provided, require it be active; stamp for SW parity
+    if sid:
+        if sid not in _active_session_ids(d):
+            return jsonify({"ok": False, "error": "session not active"}), 409
+
     pend = d.setdefault("pending_per_student", {})
     arr = pend.setdefault(student, [])
-    arr.append({"type": "open_tabs", "urls": urls, "ts": int(time.time())})
+    payload = {"type": "open_tabs", "urls": urls, "ts": int(time.time())}
+    if sid:
+        payload["session_id"] = sid
+    arr.append(payload)
     arr[:] = arr[-50:]
     save_data(d)
     return jsonify({"ok": True})
 
 
 # =========================
-# Exam Mode
+# Exam Mode (SESSION-ONLY)
 # =========================
 @app.route("/api/exam", methods=["POST"])
 def api_exam():
@@ -1493,21 +1675,28 @@ def api_exam():
     body = request.json or {}
     action = (body.get("action") or "").strip()
     url = (body.get("url") or "").strip()
-    d = ensure_keys(load_data())
+    sid = body.get("session") or body.get("session_id")
+
+    d = _ensure_sessions_students(load_data())
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
+
     if action == "start":
         if not url:
             return jsonify({"ok": False, "error": "url required"}), 400
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_start", "url": url})
+        d = _enqueue_session_cmd(d, sid, {"type": "exam_start", "url": url, "session_id": sid, "ts": int(time.time())})
         d.setdefault("exam_state", {})["active"] = True
         d["exam_state"]["url"] = url
         save_data(d)
-        log_action({"event": "exam", "action": "start", "url": url})
+        log_action({"event": "exam", "action": "start", "url": url, "session": sid})
         return jsonify({"ok": True})
     elif action == "end":
-        d.setdefault("pending_commands", {}).setdefault("*", []).append({"type": "exam_end"})
+        d = _enqueue_session_cmd(d, sid, {"type": "exam_end", "session_id": sid, "ts": int(time.time())})
         d.setdefault("exam_state", {})["active"] = False
         save_data(d)
-        log_action({"event": "exam", "action": "end"})
+        log_action({"event": "exam", "action": "end", "session": sid})
         return jsonify({"ok": True})
     return jsonify({"ok": False, "error": "invalid action"}), 400
 
@@ -1554,7 +1743,7 @@ def api_exam_violations_clear():
 
 
 # =========================
-# Notify
+# Notify (SESSION-ONLY)
 # =========================
 @app.route("/api/notify", methods=["POST"])
 def api_notify():
@@ -1564,12 +1753,15 @@ def api_notify():
     b = request.json or {}
     title = (b.get("title") or "G School")[:120]
     message = (b.get("message") or "")[:500]
-    d = ensure_keys(load_data())
-    d.setdefault("pending_commands", {}).setdefault("*", []).append({
-        "type": "notify", "title": title, "message": message
-    })
+    sid = b.get("session") or b.get("session_id")
+    d = _ensure_sessions_students(load_data())
+    if not sid:
+        return jsonify({"ok": False, "error": "session required"}), 400
+    if sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
+    d = _enqueue_session_cmd(d, sid, {"type": "notify", "title": title, "message": message, "session_id": sid, "ts": int(time.time())})
     save_data(d)
-    log_action({"event": "notify", "title": title})
+    log_action({"event": "notify", "title": title, "session": sid})
     return jsonify({"ok": True})
 
 
@@ -1587,87 +1779,6 @@ except Exception as _e:
 # # === SESSIONS/STUDENTS API ADDED ===
 import time as _time
 import uuid as _uuid
-
-def _ensure_sessions_students(store):
-    store = ensure_keys(store)
-    if "students" not in store or not isinstance(store.get("students"), list):
-        store["students"] = []
-    if "sessions" not in store or not isinstance(store.get("sessions"), list):
-        store["sessions"] = []
-    if "active_sessions" not in store or not isinstance(store.get("active_sessions"), list):
-        store["active_sessions"] = []
-    return store
-
-def _reconcile_active_sessions(store):
-    store = _ensure_sessions_students(store)
-    sessions_by_id = {s.get("id"): s for s in store.get("sessions", [])}
-    active = set(store.get("active_sessions", []))
-    for sid, sess in sessions_by_id.items():
-        if _session_is_scheduled_active(sess):
-            active.add(sid)
-        else:
-            if sid in active and not sess.get("manual", False):
-                active.discard(sid)
-    store["active_sessions"] = list(active)
-    return store
-
-def _weekly_match(entry, now_local=None):
-    try:
-        import datetime as _dt
-        now = now_local or _dt.datetime.now()
-        weekday = now.weekday()
-        if weekday not in (entry.get("days") or []):
-            return False
-        sh, sm = [int(x) for x in str(entry.get("start","00:00")).split(":")]
-        eh, em = [int(x) for x in str(entry.get("end","23:59")).split(":")]
-        start_dt = now.replace(hour=sh, minute=sm, second=0, microsecond=0)
-        end_dt = now.replace(hour=eh, minute=em, second=0, microsecond=0)
-        return start_dt <= now <= end_dt
-    except Exception:
-        return False
-
-def _oneoff_match(entry, now_ts=None):
-    try:
-        from datetime import datetime
-        now_ts = now_ts or _time.time()
-        def parse_iso(s):
-            if not s: return None
-            s = s.replace("Z","+00:00") if s.endswith("Z") else s
-            return datetime.fromisoformat(s)
-        s = parse_iso(entry.get("startISO"))
-        e = parse_iso(entry.get("endISO"))
-        return s and e and (s.timestamp() <= now_ts <= e.timestamp())
-    except Exception:
-        return False
-
-def _session_is_scheduled_active(sess):
-    sch = (sess or {}).get("schedule") or {}
-    entries = sch.get("entries") or []
-    for ent in entries:
-        t = ent.get("type")
-        if t == "weekly" and _weekly_match(ent):
-            return True
-        if t == "oneoff" and _oneoff_match(ent):
-            return True
-    return False
-
-def _effective_state_for_student(store, student_id):
-    store = _reconcile_active_sessions(_ensure_sessions_students(store))
-    sessions = store.get("sessions", [])
-    active_ids = set(store.get("active_sessions", []))
-    relevant = [s for s in sessions if s.get("id") in active_ids and student_id in (s.get("students") or [])]
-    merged = {"focusMode": False, "allowlist": [], "examMode": False, "examUrl": "", "session_ids": [s.get("id") for s in relevant]}
-    allow = set()
-    for s in relevant:
-        c = s.get("controls") or {}
-        if c.get("focusMode"): merged["focusMode"] = True
-        if c.get("examMode"):
-            merged["examMode"] = True
-            if not merged["examUrl"] and c.get("examUrl"):
-                merged["examUrl"] = c.get("examUrl")
-        for u in (c.get("allowlist") or []): allow.add(u)
-    merged["allowlist"] = sorted(list(allow))
-    return merged
 
 @app.route("/api/students", methods=["GET","POST"])
 def api_students():
@@ -1798,9 +1909,6 @@ def api_state_for_student(student_id):
     data = _ensure_sessions_students(load_data())
     merged = _effective_state_for_student(data, student_id)
     return jsonify({"ok": True, "student_id": student_id, "state": merged})
-
-# === END SESSIONS/STUDENTS API ADDED ===
-
 
 # -------------------------------
 # Teacher Sessions Console (HTML)
@@ -1981,6 +2089,7 @@ window.__SESSION_ID__ = "{sid}";
 
     return resp
 # === END SESSION LOCK INJECTION & ENFORCEMENT ===
+
 # =========================
 # Run
 # =========================
