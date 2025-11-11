@@ -115,8 +115,12 @@
   /* ===== Student Monitor ===== */
 #monitorDlg { width:clamp(1100px, 98vw, 2200px); max-height:98vh; padding:0; }
 .monitor-shell{
-  display:grid; grid-template-columns:1.6fr 360px; gap:0; height:min(92vh,860px)
+  display:grid;
+  grid-template-columns:3fr 240px; /* way bigger screen, slimmer chat */
+  gap:0;
+  height:min(96vh,1000px);
 }
+
 
   .monitor-title{font-weight:700}
   .monitor-actions{margin-left:auto; display:flex; gap:8px}
