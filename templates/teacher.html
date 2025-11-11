@@ -602,8 +602,9 @@ async function refreshPresence(){
 
     // Merge per-tab last screenshots if backend sends them
     const incomingTabshots = info.tabshots || {};
-    for (const [tid, dataUrl] of Object.entries(incomingTabshots)){
+    for (const [tid, shot] of Object.entries(incomingTabshots)){
       const t = tabs.find(x => String(x.id)===String(tid)) || {};
+      const dataUrl = typeof shot === 'string' ? shot : (shot && shot.dataUrl) || '';
       mergedShots[String(tid)] = {
         dataUrl,
         title: t.title || t.url || '',
@@ -673,7 +674,8 @@ async function refreshPresence(){
     tabs.forEach(t=>{
       const img=document.createElement('img');
       const ts = cache.tabshots && cache.tabshots[String(t.id)];
-      img.src = (ts && ts.dataUrl) || (t.favIconUrl || '');
+      const thumb = (typeof ts === 'string') ? ts : (ts && ts.dataUrl);
+      img.src = thumb || (t.favIconUrl || '');
       img.title = t.title || t.url || '';
       bar.appendChild(img);
     });
@@ -682,8 +684,9 @@ async function refreshPresence(){
       const extra = Object.entries(cache.tabshots).slice(0,8);
       extra.forEach(([_, meta])=>{
         const img=document.createElement('img');
-        img.src = meta.dataUrl || '';
-        img.title = meta.title || '';
+        const thumb = (typeof meta === 'string') ? meta : (meta && meta.dataUrl);
+        img.src = thumb || '';
+        img.title = (typeof meta === 'object' && meta && meta.title) ? meta.title : '';
         bar.appendChild(img);
       });
     }
@@ -746,7 +749,13 @@ function openStudent(student, info){
     const span=document.createElement('span'); span.textContent=t.title||t.url||''; row.appendChild(span);
     const cap=document.createElement('button'); cap.className='btn'; cap.textContent='Capture'; row.appendChild(cap);
     const x=document.createElement('button'); x.className='btn'; x.textContent='✖'; row.appendChild(x);
-    if(tabshots[t.id]){ const img=document.createElement('img'); img.src=tabshots[t.id].dataUrl; img.style.maxWidth='100%'; img.style.border='1px solid #ccc'; img.style.borderRadius='6px'; img.style.margin='6px 0'; row.appendChild(img); }
+    if(tabshots[t.id]){
+      const meta = tabshots[t.id];
+      const dataUrl = (typeof meta === 'string') ? meta : meta.dataUrl;
+      if (dataUrl){
+        const img=document.createElement('img'); img.src=dataUrl; img.style.maxWidth='100%'; img.style.border='1px solid #ccc'; img.style.borderRadius='6px'; img.style.margin='6px 0'; row.appendChild(img);
+      }
+    }
     list.appendChild(row);
     cap.onclick=async()=>{
       await fetch('/api/command',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({student, command:{type:'screencap', tabId:t.id}})});
@@ -1132,7 +1141,7 @@ async function applyScene(id){
 }
 async function disableScene(){
   $('#sceneDropdown').classList.remove('open');
-  await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({disable:true})});
+  await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({disable:true})});
   toast('Scene disabled'); loadScenes();
 }
 async function deleteScene(id){
@@ -1313,7 +1322,8 @@ function renderTabstrip(){
   MON.tabs.forEach(t=>{
     const chip = document.createElement('div');
     chip.className = 'tabchip' + (String(t.id)===String(MON.activeTabId) ? ' active':'');
-    const thumbSrc = (shots[String(t.id)] && shots[String(t.id)].dataUrl) || '';
+    const raw = shots[String(t.id)];
+    const thumbSrc = typeof raw === 'string' ? raw : (raw && raw.dataUrl) || '';
     chip.innerHTML =
       `<div class="tabhead">
          ${t.favIconUrl?`<img src="${t.favIconUrl}">`:'<span></span>'}
@@ -1345,12 +1355,15 @@ function renderTabstrip(){
 function setPreviewFromShots(){
   const shots = (studentCache[MON.student]?.tabshots)||{};
   const tab = MON.tabs.find(t=>String(t.id)===String(MON.activeTabId));
-  monPreview.src = (shots[String(MON.activeTabId)]?.dataUrl) || tab?.screenshot || (studentCache[MON.student]?.screenshot||'');
+  const raw = shots[String(MON.activeTabId)];
+  const shot = typeof raw === 'string' ? raw : (raw && raw.dataUrl);
+  monPreview.src = shot || tab?.screenshot || (studentCache[MON.student]?.screenshot||'');
 }
 
 function updatePreview(){
   const shots = (studentCache[MON.student]?.tabshots)||{};
-  const current = shots[String(MON.activeTabId)];
+  const raw = shots[String(MON.activeTabId)];
+  const current = typeof raw === 'string' ? raw : (raw && raw.dataUrl);
   const fallback = (studentCache[MON.student]?.screenshot)||'';
   monPreview.src = current || fallback || '';
   renderTabstrip();
@@ -1362,10 +1375,11 @@ async function pullOnePresence(){
   const info = pres[MON.student] || {};
   MON.tabs = info.tabs||[];
 
-  // merge incoming per-tab shots if provided
+  // merge incoming per-tab shots if provided (accept string or {dataUrl})
   const inc = info.tabshots || {};
-  for(const [tid,dataUrl] of Object.entries(inc)){
+  for(const [tid, shot] of Object.entries(inc)){
     const t = MON.tabs.find(x=> String(x.id)===String(tid)) || {};
+    const dataUrl = typeof shot === 'string' ? shot : (shot && shot.dataUrl) || '';
     setTabShot(MON.student, tid, {dataUrl, title:t.title||t.url||'', favIconUrl:t.favIconUrl||''});
   }
 
