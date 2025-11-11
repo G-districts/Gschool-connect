@@ -75,6 +75,7 @@
         }
       }
 
+      init=init||{};init.headers=init.headers||{};init.headers['X-Session-ID']=SID;
       const res = await _fetch(input, init);
       // Filter only for selected endpoints
       const watch = [/\/api\/presence\b/, /\/api\/commands\b/, /\/api\/timeline\b/, /\/api\/heartbeat\b/, /\/api\/offtask\b/];
