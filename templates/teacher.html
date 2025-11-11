@@ -114,11 +114,13 @@
 
   /* ===== Student Monitor ===== */
   #monitorDlg { width:min(1600px, 98vw); max-height:96vh; padding:0; }
-  .monitor-shell{display:grid; grid-template-columns:1.6fr 360px; gap:0; height:min(92vh,860px)}
-  .monitor-top{
-    display:flex; align-items:center; gap:10px; padding:12px 14px;
-    border-bottom:1px solid var(--border); background:var(--panel);
-  }
+ .monitor-shell {
+  display:grid;
+  grid-template-columns:2.6fr 260px; /* Bigger screen, smaller chat */
+  gap:0;
+  height:min(94vh,920px);
+}
+
   .monitor-title{font-weight:700}
   .monitor-actions{margin-left:auto; display:flex; gap:8px}
   .monitor-actions .btn{padding:6px 10px}
