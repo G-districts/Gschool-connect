@@ -137,5 +137,31 @@ async function answerOffer(client_id, offerSdp){
 startBtn.onclick = startPresent;
 stopBtn.onclick = stopPresent;
 </script>
+
+<script src="https://cdn.socket.io/4.7.2/socket.io.min.js" crossorigin="anonymous"></script>
+<script>
+const ioNS = (() => { try { return io('/present', { transports: ['websocket','polling'] }); } catch(e){ return null; } })();
+if (ioNS){
+  ioNS.emit('join', { room });
+  const oldStart = startPresent;
+  const oldStop = stopPresent;
+  startPresent = async function(){
+    await oldStart();
+    try { ioNS.emit('present_start', { room }); } catch(e){}
+  };
+  stopPresent = async function(){
+    await oldStop();
+    try { ioNS.emit('present_end', { room }); } catch(e){}
+  };
+  ioNS.on('viewer:offer', async ({client_id, sdp}) => {
+    if (!active || !screenStream) return;
+    await answerOffer(client_id, sdp);
+  });
+  ioNS.on('ice:viewer', async ({client_id, candidate}) => {
+    const pc = connections[client_id];
+    if (pc && candidate){ try { await pc.addIceCandidate(candidate); } catch(e){} }
+  });
+}
+</script>
 </body>
 </html>
