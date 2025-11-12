@@ -1,11 +1,13 @@
 # =========================
-# G-SCHOOLS CONNECT BACKEND (updated)
+# G-SCHOOLS CONNECT BACKEND (updated & fixed)
 # =========================
 
-from flask import Flask, request, jsonify, render_template, session, redirect, url_for, g
+from flask import Flask, request, jsonify, render_template, session, redirect, url_for, g, Response
 from flask_cors import CORS
-import json, os, time, sqlite3, traceback, uuid, re
+import json, os, time, sqlite3, uuid, re
 from urllib.parse import urlparse
+from collections import defaultdict
+from io import BytesIO
 
 # ---------------------------
 # Flask App Initialization
@@ -27,10 +29,17 @@ SCENES_PATH = os.path.join(ROOT, "scenes.json")
 def db():
     """Open sqlite connection (row factory stays default to keep light)."""
     con = sqlite3.connect(DB_PATH)
+    try:
+        # Slightly more robust under concurrent reads/writes
+        con.execute("PRAGMA journal_mode=WAL;")
+        con.execute("PRAGMA synchronous=NORMAL;")
+    except Exception:
+        pass
     return con
 
 def _init_db():
     """Create tables if missing; repair structure when possible."""
+    os.makedirs(ROOT, exist_ok=True)
     con = db()
     cur = con.cursor()
     cur.execute("""
@@ -76,7 +85,7 @@ def _safe_default_data():
             }
         },
         "categories": {},
-        "pending_commands": {},       # legacy (kept for compatibility but no longer used for broadcast)
+        "pending_commands": {},       # legacy (compat only; not used for broadcast)
         "pending_per_student": {},
         "pending_by_session": {},     # NEW: session-scoped command queues
         "presence": {},
@@ -85,7 +94,7 @@ def _safe_default_data():
         "dm": {},
         "alerts": [],
         "audit": [],
-        # sessions engine storage (already used below)
+        # sessions engine storage
         "students": [],
         "sessions": [],
         "active_sessions": [],
@@ -96,7 +105,6 @@ def _coerce_to_dict(obj):
     """If file accidentally became a list or invalid type, coerce to default dict."""
     if isinstance(obj, dict):
         return obj
-    # Attempt to stitch a list of dict fragments
     if isinstance(obj, list):
         d = _safe_default_data()
         for item in obj:
@@ -104,6 +112,34 @@ def _coerce_to_dict(obj):
                 d.update(item)
         return d
     return _safe_default_data()
+
+def ensure_keys(d):
+    d.setdefault("settings", {}).setdefault("chat_enabled", False)
+    d.setdefault("classes", {}).setdefault("period1", {
+        "name": "Period 1",
+        "active": True,
+        "focus_mode": False,
+        "paused": False,
+        "allowlist": [],
+        "teacher_blocks": [],
+        "students": []
+    })
+    d.setdefault("categories", {})
+    d.setdefault("pending_commands", {})
+    d.setdefault("pending_per_student", {})
+    d.setdefault("pending_by_session", {})  # NEW
+    d.setdefault("presence", {})
+    d.setdefault("history", {})
+    d.setdefault("screenshots", {})
+    d.setdefault("alerts", [])
+    d.setdefault("dm", {})
+    d.setdefault("audit", [])
+    d.setdefault("extension_enabled", True)
+    # sessions engine storage
+    d.setdefault("students", [])
+    d.setdefault("sessions", [])
+    d.setdefault("active_sessions", [])
+    return d
 
 def load_data():
     """Load JSON with self-repair for common corruption patterns."""
@@ -162,34 +198,6 @@ def set_setting(key, value):
 
 def current_user():
     return session.get("user")
-
-def ensure_keys(d):
-    d.setdefault("settings", {}).setdefault("chat_enabled", False)
-    d.setdefault("classes", {}).setdefault("period1", {
-        "name": "Period 1",
-        "active": True,
-        "focus_mode": False,
-        "paused": False,
-        "allowlist": [],
-        "teacher_blocks": [],
-        "students": []
-    })
-    d.setdefault("categories", {})
-    d.setdefault("pending_commands", {})
-    d.setdefault("pending_per_student", {})
-    d.setdefault("pending_by_session", {})  # NEW
-    d.setdefault("presence", {})
-    d.setdefault("history", {})
-    d.setdefault("screenshots", {})
-    d.setdefault("alerts", [])
-    d.setdefault("dm", {})
-    d.setdefault("audit", [])
-    d.setdefault("extension_enabled", True)
-    # sessions engine storage
-    d.setdefault("students", [])
-    d.setdefault("sessions", [])
-    d.setdefault("active_sessions", [])
-    return d
 
 def log_action(entry):
     try:
@@ -253,7 +261,12 @@ def index():
     u = current_user()
     if not u:
         return redirect(url_for("login_page"))
-    return redirect(url_for("teacher_page" if u["role"] != "admin" else "admin_page"))
+    # Send admins to admin; teachers to teacher; others to login (no dedicated student console page here)
+    if u["role"] == "admin":
+        return redirect(url_for("admin_page"))
+    if u["role"] == "teacher":
+        return redirect(url_for("teacher_page"))
+    return redirect(url_for("login_page"))
 
 @app.route("/login")
 def login_page():
@@ -279,24 +292,18 @@ def logout():
     return redirect(url_for("login_page"))
 
 
-
 # =========================
 # Teacher Presentation (WebRTC signaling via REST polling)
 # =========================
-
-from datetime import datetime
-from collections import defaultdict
 
 # In-memory session store: {room: {offers:{client_id: sdp}, answers:{client_id:sdp}, cand_v:{client_id:[cands]}, cand_t:{client_id:[cands]}, updated:int, active:bool}}
 PRESENT = defaultdict(lambda: {"offers": {}, "answers": {}, "cand_v": defaultdict(list), "cand_t": defaultdict(list), "updated": int(time.time()), "active": False})
 
 def _clean_room(room):
     r = PRESENT.get(room)
-    if not r: return
-    # drop stale viewers (> 10 minutes inactivity)
-    now = int(time.time())
-    # (kept minimal; offers do not store timestamps currently)
-    r["updated"] = now
+    if not r:
+        return
+    r["updated"] = int(time.time())
 
 @app.route("/teacher/present")
 def teacher_present_page():
@@ -359,7 +366,6 @@ def api_present_answer(room, client_id):
         body = request.json or {}
         sdp = body.get("sdp")
         r["answers"][client_id] = sdp
-        # once answered, remove offer (optional)
         if client_id in r["offers"]:
             del r["offers"][client_id]
         r["updated"] = int(time.time())
@@ -385,7 +391,6 @@ def api_present_candidate(room, side, client_id):
         r["updated"] = int(time.time())
         return jsonify({"ok": True})
     else:
-        # GET fetch and clear incoming candidates for this side
         cands = bucket_to.get(client_id, [])
         bucket_to[client_id] = []
         return jsonify({"ok": True, "candidates": cands})
@@ -414,9 +419,10 @@ def api_login():
 # =========================
 @app.route("/api/data")
 def api_data():
+    # Consistent defaults aligned with _safe_default_data()
     return jsonify({
         "settings": {
-            "chat_enabled": bool(get_setting("chat_enabled", True)),
+            "chat_enabled": bool(get_setting("chat_enabled", False)),
             "youtube_mode": get_setting("youtube_mode", "normal"),
         },
         "lists": {
@@ -496,7 +502,6 @@ def api_class_set():
 
     body = request.json or {}
     cls = d["classes"].get("period1", {})
-    prev_active = bool(cls.get("active", True))
 
     if "teacher_blocks" in body:
         set_setting("teacher_blocks", body["teacher_blocks"])
@@ -521,7 +526,6 @@ def api_class_set():
 
     d["classes"]["period1"] = cls
 
-    # No more global notify via "*" here.
     save_data(d)
     log_action({"event": "class_set", "active": cls.get("active", True)})
     return jsonify({"ok": True, "class": cls, "settings": d["settings"]})
@@ -560,37 +564,6 @@ def _ensure_sessions_students(store):
         store["active_sessions"] = []
     if "pending_by_session" not in store or not isinstance(store.get("pending_by_session"), dict):
         store["pending_by_session"] = {}
-    return store
-
-def _reconcile_active_sessions(store):
-    store = _ensure_sessions_students(store)
-    sessions_by_id = {s.get("id"): s for s in store.get("sessions", [])}
-    active = set(store.get("active_sessions", []))
-    for sid, sess in sessions_by_id.items():
-        if _session_is_scheduled_active(sess):
-            active.add(sid)
-        else:
-            if sid in active and not sess.get("manual", False):
-                active.discard(sid)
-    store["active_sessions"] = list(active)
-    return store
-
-def _active_session_ids(store):
-    store = _reconcile_active_sessions(_ensure_sessions_students(store))
-    return set(store.get("active_sessions", []))
-
-def _student_active_sessions(store, student_id):
-    store = _reconcile_active_sessions(_ensure_sessions_students(store))
-    act = _active_session_ids(store)
-    return [s.get("id") for s in store.get("sessions", []) if s.get("id") in act and student_id in (s.get("students") or [])]
-
-def _enqueue_session_cmd(store, sid, cmd):
-    """Append a command into a session queue (cap length)."""
-    store = _ensure_sessions_students(store)
-    q = store.setdefault("pending_by_session", {}).setdefault(sid, [])
-    q.append(cmd)
-    if len(q) > 200:
-        del q[:-200]
     return store
 
 def _weekly_match(entry, now_local=None):
@@ -633,6 +606,37 @@ def _session_is_scheduled_active(sess):
             return True
     return False
 
+def _reconcile_active_sessions(store):
+    store = _ensure_sessions_students(store)
+    sessions_by_id = {s.get("id"): s for s in store.get("sessions", [])}
+    active = set(store.get("active_sessions", []))
+    for sid, sess in sessions_by_id.items():
+        if _session_is_scheduled_active(sess):
+            active.add(sid)
+        else:
+            if sid in active and not sess.get("manual", False):
+                active.discard(sid)
+    store["active_sessions"] = list(active)
+    return store
+
+def _active_session_ids(store):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    return set(store.get("active_sessions", []))
+
+def _student_active_sessions(store, student_id):
+    store = _reconcile_active_sessions(_ensure_sessions_students(store))
+    act = _active_session_ids(store)
+    return [s.get("id") for s in store.get("sessions", []) if s.get("id") in act and student_id in (s.get("students") or [])]
+
+def _enqueue_session_cmd(store, sid, cmd):
+    """Append a command into a session queue (cap length)."""
+    store = _ensure_sessions_students(store)
+    q = store.setdefault("pending_by_session", {}).setdefault(sid, [])
+    q.append(cmd)
+    if len(q) > 200:
+        del q[:-200]
+    return store
+
 def _effective_state_for_student(store, student_id):
     store = _reconcile_active_sessions(_ensure_sessions_students(store))
     sessions = store.get("sessions", [])
@@ -668,12 +672,10 @@ def api_command():
     d = _ensure_sessions_students(load_data())
     b = request.json or {}
 
-    # Session required
     sid = b.get("session") or b.get("session_id")
     if not sid:
         return jsonify({"ok": False, "error": "session required"}), 400
 
-    # Must be active
     if sid not in _active_session_ids(d):
         return jsonify({"ok": False, "error": "session not active"}), 409
 
@@ -681,16 +683,13 @@ def api_command():
     if not cmd or "type" not in cmd:
         return jsonify({"ok": False, "error": "invalid"}), 400
 
-    # stamp session id inside the command so SW can double check
     cmd = dict(cmd)
     cmd["session_id"] = sid
     cmd["ts"] = int(time.time())
 
-    # If student targeted, we still put into session queue (SW will also verify enrollment)
     target_student = (b.get("student") or "").strip()
     d = _enqueue_session_cmd(d, sid, cmd)
 
-    # Also allow explicit per-student queue (session-stamped) if provided
     if target_student:
         pend = d.setdefault("pending_per_student", {})
         arr = pend.setdefault(target_student, [])
@@ -706,31 +705,22 @@ def api_commands(student):
     d = _ensure_sessions_students(load_data())
 
     if request.method == "GET":
-        # Deliver only:
-        #  - per-student commands (one-shot), and
-        #  - commands queued for any ACTIVE session that includes this student.
         out = []
 
-        # Per-student one-shots
         per_stu = d.get("pending_per_student", {}).get(student, [])
         if per_stu:
             out.extend(per_stu)
             d["pending_per_student"][student] = []
 
-        # Session-scoped: for each active session containing this student
         active_sids = _student_active_sessions(d, student)
         pbs = d.get("pending_by_session", {})
         for sid in active_sids:
             queue = pbs.get(sid, [])
             if queue:
-                # Keep only those commands stamped with the same sid (paranoia)
                 to_take = [c for c in queue if str(c.get("session_id")) == str(sid)]
                 out.extend(to_take)
-                # Remove delivered ones from the queue
                 remaining = [c for c in queue if c not in to_take]
                 pbs[sid] = remaining
-
-        # (Legacy) Completely ignore global pending_commands["*"] and per-student pending_commands here.
 
         save_data(d)
         return jsonify({"commands": out})
@@ -755,7 +745,6 @@ def api_commands(student):
     cmd["ts"] = int(time.time())
 
     d = _enqueue_session_cmd(d, sid, cmd)
-    # Also tuck into per-student if URL path provides a student id (it does)
     d.setdefault("pending_per_student", {}).setdefault(student, []).append(dict(cmd))
     save_data(d)
     log_action({"event": "command_sent", "to": student, "cmd": cmd.get("type"), "session": sid})
@@ -763,7 +752,7 @@ def api_commands(student):
 
 
 # =========================
-# Off-task Check (simple)  — FIXED to use current scene & class allowlist
+# Off-task Check (simple)
 # =========================
 def _effective_allowlist_for_policy():
     """Compute the effective allowlist based on class settings and current scene."""
@@ -773,7 +762,6 @@ def _effective_allowlist_for_policy():
     scenes = _load_scenes()
     current = scenes.get("current") or None
     if current:
-        # find full scene object
         scene_obj = None
         for bucket in ("allowed", "blocked"):
             for s in scenes.get(bucket, []):
@@ -796,11 +784,9 @@ def api_offtask_check():
 
     d = ensure_keys(load_data())
 
-    # Build allowlist domains from effective policy
     allow_patterns = _effective_allowlist_for_policy()
     scene_allowed = set()
     for patt in (allow_patterns or []):
-        # match patterns like *://*.example.com/*
         m = re.match(r"\*\:\/\/\*\.(.+?)\/\*", patt)
         if m:
             scene_allowed.add(m.group(1).lower())
@@ -822,10 +808,10 @@ def api_offtask_check():
     save_data(d)
 
     try:
-        # If using socketio, you could emit here; safely ignore if not present
+        # Optional: emit if flask_socketio is present; ignore otherwise
         from flask_socketio import SocketIO  # type: ignore
         socketio = SocketIO(message_queue=None)
-        socketio.emit("offtask", v, broadcast=True)
+        socketio.emit("offtask", v)
     except Exception:
         pass
 
@@ -842,7 +828,6 @@ def api_heartbeat():
     student = (b.get("student") or "").strip()
     display_name = b.get("student_name", "")
 
-    # Global kill switch (safe if file type changed)
     data_global = ensure_keys(load_data())
     extension_enabled_global = bool(data_global.get("extension_enabled", True))
 
@@ -851,7 +836,7 @@ def api_heartbeat():
         return jsonify({
             "ok": True,
             "server_time": int(time.time()),
-            "extension_enabled": False  # completely disabled for guests
+            "extension_enabled": False
         })
 
     d = ensure_keys(load_data())
@@ -863,7 +848,6 @@ def api_heartbeat():
         pres["student_name"] = display_name
         pres["tab"] = b.get("tab", {}) or {}
         pres["tabs"] = b.get("tabs", []) or []
-        # support both camel and snake favicon key names
         if "favIconUrl" in pres.get("tab", {}):
             pass
         elif "favicon" in pres.get("tab", {}):
@@ -871,7 +855,7 @@ def api_heartbeat():
 
         pres["screenshot"] = b.get("screenshot", "") or ""
 
-        # --- Keep only screenshots for open tabs shown in modal preview ---
+        # Keep only screenshots for open tabs shown in modal preview
         shots = pres.get("tabshots", {})
         for k, v in (b.get("tabshots", {}) or {}).items():
             shots[str(k)] = v
@@ -882,7 +866,7 @@ def api_heartbeat():
         pres["tabshots"] = shots
         d["presence"][student] = pres
 
-        # ---------- Timeline & Screenshot history ----------
+        # Timeline & Screenshot history
         try:
             timeline = d.setdefault("history", {}).setdefault(student, [])
             now = int(time.time())
@@ -902,9 +886,8 @@ def api_heartbeat():
 
             if should_add:
                 timeline.append({"ts": now, "title": title, "url": url, "favIconUrl": fav})
-                d["history"][student] = timeline[-500:]  # cap
+                d["history"][student] = timeline[-500:]
 
-            # Screenshot history: if extension passes `shot_log: [{tabId,dataUrl,title,url}]`
             shot_log = b.get("shot_log") or []
             if shot_log:
                 hist = d.setdefault("screenshots", {}).setdefault(student, [])
@@ -922,14 +905,12 @@ def api_heartbeat():
 
     save_data(d)
 
-    # NEW: surface active sessions + merged effective state for this student
     active_for_student = _student_active_sessions(d, student) if student else []
     effective = _effective_state_for_student(d, student) if student else {}
 
     return jsonify({
         "ok": True,
         "server_time": int(time.time()),
-        # Honor global kill switch but also keep guest lockout enforced above.
         "extension_enabled": bool(extension_enabled_global),
         "sessions": {
             "active_for_student": active_for_student,
@@ -992,11 +973,10 @@ def api_policy():
         d["pending_per_student"].pop(student, None)
         save_data(d)
 
-    # Scene merge logic (no over-blocking)
+    # Scene merge
     store = _load_scenes()
     current = store.get("current") or None
 
-    # Start with class-level lists
     allowlist = list(cls.get("allowlist", []))
     teacher_blocks = list(cls.get("teacher_blocks", []))
 
@@ -1012,14 +992,11 @@ def api_policy():
 
         if scene_obj:
             if scene_obj.get("type") == "allowed":
-                # allow-only mode (focus true)
                 allowlist = list(scene_obj.get("allow", []))
                 focus = True
             elif scene_obj.get("type") == "blocked":
-                # add extra teacher block patterns
                 teacher_blocks = (teacher_blocks or []) + list(scene_obj.get("block", []))
 
-    # NEW: sessions info for the extension
     active_for_student = _student_active_sessions(d, student) if student else []
 
     resp = {
@@ -1239,7 +1216,6 @@ def api_scenes_import():
 
 @app.route("/api/scenes/apply", methods=["POST"])
 def api_scenes_apply():
-    # No command broadcast here; scenes affect /api/policy merge.
     u = current_user()
     if not u or u["role"] not in ("teacher", "admin"):
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -1343,7 +1319,6 @@ def api_dm_me():
 
 @app.route("/api/dm/<student>", methods=["GET"])
 def api_dm_get(student):
-    """Return the DM thread for a student from the sqlite store (aligns with /api/dm/me)."""
     u = current_user()
     if not u:
         return jsonify({"ok": False, "error": "forbidden"}), 403
@@ -1355,17 +1330,15 @@ def api_dm_get(student):
 
 @app.route("/api/dm/unread", methods=["GET"])
 def api_dm_unread():
-    # Simple stub (no unread tracking in sqlite); return empty counts.
     return jsonify({})
 
 @app.route("/api/dm/mark_read", methods=["POST"])
 def api_dm_mark_read():
-    # No-op with sqlite-backed storage (unread not tracked); succeed to satisfy clients.
     return jsonify({"ok": True})
 
 
 # =========================
-# Attention Check (SESSION-ONLY)  — FIXED to persist state/responses
+# Attention Check (SESSION-ONLY)
 # =========================
 @app.route("/api/attention_check", methods=["POST"])
 def api_attention_check():
@@ -1388,7 +1361,6 @@ def api_attention_check():
     cmd = {"type": "attention_check", "title": title, "timeout": timeout, "session_id": sid, "ts": ts_now}
     d = _enqueue_session_cmd(d, sid, cmd)
 
-    # Persist current attention check state
     d["attention_check"] = {
         "title": title,
         "timeout": timeout,
@@ -1559,7 +1531,6 @@ def api_youtube_rules():
         set_setting("yt_block_channels", body.get("block_channels", []))
         set_setting("yt_allow", body.get("allow", []))
         set_setting("yt_allow_mode", bool(body.get("allow_mode", False)))
-        # Do NOT broadcast here; SW will pull via /api/state if needed.
         log_action({"event": "youtube_rules_update"})
         return jsonify({"ok": True})
 
@@ -1690,10 +1661,8 @@ def api_student_open_tabs():
         return jsonify({"ok": False, "error": "student and urls required"}), 400
 
     d = _ensure_sessions_students(load_data())
-    # if a session is provided, require it be active; stamp for SW parity
-    if sid:
-        if sid not in _active_session_ids(d):
-            return jsonify({"ok": False, "error": "session not active"}), 409
+    if sid and sid not in _active_session_ids(d):
+        return jsonify({"ok": False, "error": "session not active"}), 409
 
     pend = d.setdefault("pending_per_student", {})
     arr = pend.setdefault(student, [])
@@ -1817,9 +1786,7 @@ except Exception as _e:
     print("AI routes not loaded:", _e)
 
 
-
 # # === SESSIONS/STUDENTS API ADDED ===
-import time as _time
 import uuid as _uuid
 
 @app.route("/api/students", methods=["GET","POST"])
@@ -1926,7 +1893,8 @@ def api_session_start(sid):
     act.add(sid)
     data["active_sessions"] = list(act)
     for s in data.get("sessions", []):
-        if s.get("id") == sid: s["manual"] = True
+        if s.get("id") == sid:
+            s["manual"] = True
     save_data(data)
     return jsonify({"ok": True, "active": data["active_sessions"]})
 
@@ -1935,7 +1903,8 @@ def api_session_end(sid):
     data = _ensure_sessions_students(load_data())
     data["active_sessions"] = [x for x in data.get("active_sessions", []) if x != sid]
     for s in data.get("sessions", []):
-        if s.get("id") == sid: s["manual"] = False
+        if s.get("id") == sid:
+            s["manual"] = False
     save_data(data)
     return jsonify({"ok": True, "active": data["active_sessions"]})
 
@@ -1951,6 +1920,7 @@ def api_state_for_student(student_id):
     data = _ensure_sessions_students(load_data())
     merged = _effective_state_for_student(data, student_id)
     return jsonify({"ok": True, "student_id": student_id, "state": merged})
+
 
 # -------------------------------
 # Teacher Sessions Console (HTML)
@@ -1968,9 +1938,7 @@ def teacher_sessions_page():
 # ----------------------------------------------
 @app.route("/teacher/session/<sid>")
 def teacher_session_locked(sid):
-    # Load teacher.html and inject a session lock script before </body>
     try:
-        from flask import Response
         tpl_path = os.path.join(app.template_folder, "teacher.html")
         with open(tpl_path, "r", encoding="utf-8") as f:
             html = f.read()
@@ -1990,25 +1958,13 @@ window.__SESSION_ID__ = "{sid}";
         return f"Failed to render locked teacher session: {e}", 500
 
 
-
-
-
 # === SESSION LOCK INJECTION & ENFORCEMENT ===
-from io import BytesIO
 
-# Heuristic keys we consider as student identifiers
 _STUDENT_ID_KEYS = ('student','email','id','user','student_id')
-# Endpoints we *definitely* scope
 _SESSION_SCOPED_PREFIXES = (
     '/api/presence', '/api/commands', '/api/timeline',
     '/api/heartbeat', '/api/offtask', '/api/present'
 )
-
-def _looks_like_email(s):
-    try:
-        return isinstance(s, str) and '@' in s and '.' in s.split('@')[-1]
-    except Exception:
-        return False
 
 def _extract_student_id_from_body(body):
     if not isinstance(body, dict):
@@ -2017,41 +1973,33 @@ def _extract_student_id_from_body(body):
         v = body.get(key)
         if isinstance(v, str) and v.strip():
             return v.strip()
-    d = body.get('data')
-    if isinstance(d, dict):
+    d2 = body.get('data')
+    if isinstance(d2, dict):
         for key in _STUDENT_ID_KEYS:
-            v = d.get(key)
+            v = d2.get(key)
             if isinstance(v, str) and v.strip():
                 return v.strip()
     return None
 
 def _filter_json_by_roster(obj, roster):
-    """Recursively filter any arrays/dicts to keep only entries whose student/email/id is in roster.
-    If roster is empty, return empty arrays for any list of student-like dicts.
-    """
+    """Recursively filter any arrays/dicts to keep only entries whose student/email/id is in roster."""
     try:
         if isinstance(obj, list):
             out = []
             for x in obj:
                 if isinstance(x, dict):
-                    # Attempt to find a student-like identifier
                     sid = None
                     for k in _STUDENT_ID_KEYS:
                         if k in x and isinstance(x[k], str):
                             sid = x[k]
                             break
-                    if sid is not None:
-                        # If this looks like an email, enforce roster on exact match
-                        if (not roster) or (sid not in roster):
-                            # drop
-                            continue
+                    if sid is not None and roster and sid not in roster:
+                        continue
                     out.append(_filter_json_by_roster(x, roster))
                 else:
-                    # Non-dict list entries are kept as-is
                     out.append(_filter_json_by_roster(x, roster))
             return out
         if isinstance(obj, dict):
-            # If dict contains nested lists/dicts, filter them
             return {k: _filter_json_by_roster(v, roster) for k, v in obj.items()}
         return obj
     except Exception:
@@ -2059,7 +2007,6 @@ def _filter_json_by_roster(obj, roster):
 
 @app.before_request
 def _session_scoping_before():
-    from flask import g
     g._session_id = request.args.get('session') or request.headers.get('X-Session-ID')
     g._session_students = set()
 
@@ -2068,7 +2015,6 @@ def _session_scoping_before():
             store = ensure_keys(load_data())
             for s in store.get("sessions", []):
                 if s.get("id") == g._session_id:
-                    # Treat both explicit ids and emails as identifiers
                     g._session_students = set(s.get("students") or [])
                     break
         except Exception:
@@ -2080,17 +2026,15 @@ def _session_scoping_before():
             try:
                 if request.is_json:
                     body = request.get_json(silent=True) or {}
-                    # Intersect arrays of students
                     if isinstance(body.get('students'), list):
                         body['students'] = [x for x in body['students'] if x in g._session_students]
-                    # If single student specified and not in roster → no-op
                     sid = _extract_student_id_from_body(body)
                     if sid and g._session_students and sid not in g._session_students:
-                        from flask import Response
                         return Response(json.dumps({"ok": True, "ignored": True, "reason": "student not in session"}),
                                         status=200, mimetype="application/json")
                     data = json.dumps(body).encode('utf-8')
-                    request._cached_data = data
+                    # refresh request stream/cache with filtered payload
+                    request._cached_data = data  # Werkzeug uses this cache internally
                     request.environ['wsgi.input'] = BytesIO(data)
                     request.environ['CONTENT_LENGTH'] = str(len(data))
             except Exception:
@@ -2098,7 +2042,6 @@ def _session_scoping_before():
 
 @app.after_request
 def _session_scoping_after(resp):
-    from flask import g
     # Inject the session lock script into teacher.html when ?session=SID
     try:
         if request.path.rstrip('/') == '/teacher' and request.args.get('session') and resp.mimetype and resp.mimetype.startswith('text/html'):
@@ -2120,16 +2063,19 @@ window.__SESSION_ID__ = "{sid}";
     # Global JSON roster filter when in a session board
     try:
         if getattr(g, '_session_id', None) and resp.mimetype == 'application/json':
-            # If this is a known teacher endpoint OR any /api/* returning JSON, filter by roster
             if any(request.path.startswith(p) for p in _SESSION_SCOPED_PREFIXES) or request.path.startswith('/api/'):
                 raw = resp.get_data(as_text=True) or 'null'
-                data = json.loads(raw)
+                try:
+                    data = json.loads(raw)
+                except Exception:
+                    return resp  # not JSON parseable; leave as-is
                 filtered = _filter_json_by_roster(data, g._session_students)
                 resp.set_data(json.dumps(filtered))
     except Exception:
         pass
 
     return resp
+
 # === END SESSION LOCK INJECTION & ENFORCEMENT ===
 
 # =========================
@@ -2137,5 +2083,12 @@ window.__SESSION_ID__ = "{sid}";
 # =========================
 if __name__ == "__main__":
     # Ensure data.json exists and is sane on boot
+    os.makedirs(ROOT, exist_ok=True)
+    if not os.path.exists(DATA_PATH):
+        save_data(_safe_default_data())
+    # Ensure scenes store exists
+    if not os.path.exists(SCENES_PATH):
+        _save_scenes({"allowed": [], "blocked": [], "current": None})
+    # Re-save to normalize structure if previous files existed
     save_data(ensure_keys(load_data()))
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
