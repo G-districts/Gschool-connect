@@ -320,31 +320,97 @@
   }
 </script>
 
-<!-- ===== Roster/session filter (NEW) ===== -->
+<!-- ===== Roster/session filter (FIXED) ===== -->
 <script>
-  // Class/session roster — used to filter UI
+  // Canonical roster matcher (accepts emails, ids, names)
   let CLASS_ID = null;
-  let CLASS_ROSTER = null;     // Set<string>
-  let SESSION_ROSTER = null;   // Set<string>
+  const ROSTER_CANON = new Set();   // allowed canonical strings
+  const EMAIL_BY_ID  = {};          // presenceKey -> email (when known)
 
-  // Show only if the id is in current class/session
-  function inSession(id){
-    const key = String(id || '').toLowerCase();
-    if (CLASS_ROSTER)   return CLASS_ROSTER.has(key);
-    if (SESSION_ROSTER) return SESSION_ROSTER.has(key);
-    return true; // if nothing is known, don't hide anyone
+  const canon = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .trim()
+      .replace(/[^\p{L}\p{N}@._-]+/gu, ''); // keep letters/numbers/@._-
+
+  const nameCanon = (s) =>
+    String(s || '')
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}]+/gu, ''); // letters+numbers only
+
+  function addVariants(strLike) {
+    const raw = String(strLike || '');
+    if (!raw) return;
+    const c = canon(raw);
+    if (c) ROSTER_CANON.add(c);
+
+    const at = raw.indexOf('@');
+    if (at > 0) ROSTER_CANON.add(canon(raw.slice(0, at)));
+
+    const nc = nameCanon(raw);
+    if (nc) ROSTER_CANON.add(nc);
   }
 
-  // Prefer: /api/class/set -> /api/class/:id/roster -> /api/sessions/:id
+  function addFromObject(o) {
+    const fields = [
+      'id','student_id','device_id','username',
+      'email','mail',
+      'name','displayName','display_name','full_name'
+    ];
+    fields.forEach(f => { if (o && o[f]) addVariants(o[f]); });
+  }
+
+  function addFromArray(arr) {
+    (arr || []).forEach(item => {
+      if (item && typeof item === 'object') addFromObject(item);
+      else addVariants(item);
+    });
+  }
+
+  function mergeRosterPayload(payload) {
+    if (!payload) return;
+
+    addFromArray(payload.students);
+    addFromArray(payload.roster);
+    addFromArray(payload.participants);
+    addFromArray(payload.emails);
+    addFromArray(payload.roster_emails);
+    addFromArray(payload.ids);
+    addFromArray(payload.names);
+
+    if (payload.class)   mergeRosterPayload(payload.class);
+    if (payload.session) mergeRosterPayload(payload.session);
+  }
+
+  function haveAllowlist() { return ROSTER_CANON.size > 0; }
+
+  function inSession(id) {
+    if (!haveAllowlist()) return true;
+
+    const key = String(id || '');
+    const variants = new Set();
+
+    variants.add(canon(key));
+    const at = key.indexOf('@'); if (at > 0) variants.add(canon(key.slice(0, at)));
+    variants.add(nameCanon(key));
+
+    const em = EMAIL_BY_ID[key];
+    if (em) {
+      variants.add(canon(em));
+      const at2 = em.indexOf('@'); if (at2 > 0) variants.add(canon(em.slice(0, at2)));
+      variants.add(nameCanon(em));
+    }
+
+    for (const v of variants) { if (v && ROSTER_CANON.has(v)) return true; }
+    return false;
+  }
+
   async function _loadFromClassSet(){
     try{
       const j = await (await fetch('/api/class/set', { method:'GET' })).json();
+      mergeRosterPayload(j);
       const cls = j.class || {};
       CLASS_ID = cls.id || cls.class_id || CLASS_ID || 'period1';
-      const emails = cls.students || cls.roster || cls.emails || cls.roster_emails || [];
-      if (emails && emails.length){
-        CLASS_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
-      }
     }catch(_){}
   }
 
@@ -353,11 +419,7 @@
     try{
       const r = await fetch(`/api/class/${encodeURIComponent(CLASS_ID)}/roster`);
       if (!r.ok) return;
-      const j = await r.json();
-      const emails = j.students || j.roster || j.emails || j.roster_emails || [];
-      if (emails && emails.length){
-        CLASS_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
-      }
+      mergeRosterPayload(await r.json());
     }catch(_){}
   }
 
@@ -365,28 +427,25 @@
     if (!SESSION_ID) return;
     try{
       const j = await (await fetch(`/api/sessions/${encodeURIComponent(SESSION_ID)}`)).json();
-      const emails =
-        (j.session && (j.session.students || j.session.roster || j.session.emails)) ||
-        j.students || j.roster || j.emails || [];
-      if (emails && emails.length){
-        SESSION_ROSTER = new Set(emails.map(e => String(e).toLowerCase()));
-      }
+      mergeRosterPayload(j);
     }catch(_){}
   }
 
-  // Bootstrap once, then refresh occasionally (optional)
   (async function bootstrapRoster(){
     await _loadFromClassSet();
-    if (!CLASS_ROSTER) await _loadFromClassRosterEndpoint();
-    if (!CLASS_ROSTER) await _loadFromSession();
+    await _loadFromClassRosterEndpoint();
+    await _loadFromSession();
 
-    // Refresh every 20s in case roster changes (safe to remove if not needed)
     setInterval(async ()=>{
       await _loadFromClassSet();
-      if (!CLASS_ROSTER) await _loadFromClassRosterEndpoint();
-      if (!CLASS_ROSTER) await _loadFromSession();
+      await _loadFromClassRosterEndpoint();
+      await _loadFromSession();
     }, 20000);
   })();
+
+  // expose for other blocks that call inSession(...)
+  window.inSession = inSession;
+  window.__EMAIL_BY_ID = EMAIL_BY_ID;
 </script>
 
 <!-- ===== Scene Editor (unchanged) ===== -->
@@ -574,12 +633,19 @@ async function loadData(){
 loadData();
 
 /* -----------------------------------------------------------
-   Presence refresh & grid render (FILTERED)
+   Presence refresh & grid render (FILTERED & EMAIL-AWARE)
 ----------------------------------------------------------- */
 async function refreshPresence(){
   const res = await fetch('/api/presence'); if(!res.ok) return;
   const pres = await res.json(); state.presence = pres;
   const now = Date.now();
+
+  // Learn emails (if presence provides them) so roster matching works
+  Object.entries(pres).forEach(([student, info])=>{
+    const email = (info && (info.email || info.mail)) ||
+                  (info && info.user && (info.user.email || info.user.mail));
+    if (email) (window.__EMAIL_BY_ID || {})[student] = email;
+  });
 
   Object.entries(pres).forEach(([student, info])=>{
     const existing = studentCache[student] || {tabshots:{}};
@@ -946,7 +1012,6 @@ async function loadScenes(){
     const j = await _load_scenes_api();
     const sess = await _load_session_scene();
     state.scenes.allowed=j.allowed||[]; state.scenes.blocked=j.blocked||[]; 
-    // prefer per-session current; fallback to global
     state.scenes.current = sess.current_session || (j.current||null);
     renderSceneLists(); renderSceneDropdown();
   }catch(e){ console.warn('scenes load failed',e); }
@@ -1097,7 +1162,6 @@ async function disableScene(){
   if(SESSION_ID){
     await fetch('/api/scenes/apply_session',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({session: SESSION_ID, disable:true})});
   }else{
-    // fallback: global disable
     await fetch('/api/scenes/apply',{method:'POST',headers:{'Content-Type':'application/json'},body: JSON.stringify({disable:true})});
   }
   toast('Scene disabled'); loadScenes();
